@@ -52,7 +52,7 @@ internal/
   remediation/         pure core: Decide(facts, now) -> Decision
                         (condition match, nodeSelector, debounce state machine, guard percentage)
   controller/          thin shell: OBSERVE -> DECIDE -> ACT (taint apply/remove, status once)
-  predicate/           conditionStatusChanged, label-changed, generation-changed
+  predicate/           conditionStatusChanged, taintsChanged
 hack/
 test/                  envtest + e2e (kind)
 ```
@@ -63,17 +63,20 @@ High level only here; a fuller write-up of the mechanics (predicate specifics, t
 debounce-via-`lastTransitionTime` state machine, the guard-percentage math) lands with the
 behavior itself.
 
-- **OBSERVE**: the controller watches `Node` and `NodeRemediationPolicy` objects through
-  predicates that filter out noise -- kubelet heartbeats, lease/heartbeat-only condition
-  churn, and the controller's own status writes -- so the loop only wakes up on changes that
-  can actually affect a decision. It then gathers read-only facts: the policies, and per node
-  its conditions (with `lastTransitionTime`), labels, and current taints.
+- **OBSERVE**: the controller watches `Node` and `NodeRemediationPolicy` objects. `Node` updates
+  go through predicates that drop noise -- kubelet heartbeats and lease/heartbeat-only condition
+  churn -- so the loop only wakes on changes that can affect a decision. Policy updates are not
+  filtered: the loop is idempotent (status is written only when it changed), so the controller's
+  own status writes settle in a no-op pass instead of looping, and a hand-edited status is
+  reconciled back. It then gathers read-only facts: the policies, and per node the one condition
+  its policy watches (with `lastTransitionTime`), labels, and current taints.
 - **DECIDE**: the facts and the current time are passed to the pure `Decide` function, which
   evaluates each policy against the nodes it selects and returns a `Decision` -- which taints to
   add or remove, the status to write per policy, and when to requeue.
 - **ACT**: the shell applies the decision (taint add/remove on the matched nodes) and writes each
   policy's status exactly once, then requeues if it asks for it (e.g. to re-check a
-  pending debounce window later).
+  pending debounce window later). It also emits structured logs and Kubernetes `Events` for
+  what happened (see below), so an operator can follow the decisions without reading logs.
 
 Because the decision is pure, edge cases -- flapping, a partial outage over the guard,
 `Unknown` conditions, recovery, relabeling, self-trigger loops -- are covered by table-driven
@@ -103,3 +106,9 @@ unit tests against `Decide`, not by cluster-dependent tests against the controll
   by its identity, so allowing the key, value or effect to change would orphan the taint already
   applied; keeping it immutable means observe/apply/remove stay keyed on a single, stable
   identity. Changing the remediation means deleting and recreating the policy.
+- **Events go on the object each fact is about.** A per-node action (`TaintApplied`,
+  `TaintRemoved`) is recorded on both the affected `Node` -- so `kubectl describe node` explains
+  why the node is tainted, like the node-lifecycle controllers do -- and on the policy. A
+  policy-level decision (`GuardTripped`, `InvalidSpec`, `MissingTransitionTime`) is recorded only
+  on the policy, since it is not about any single node. Node events carry the node's UID so they
+  surface under `kubectl describe node`.

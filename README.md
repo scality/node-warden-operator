@@ -17,6 +17,11 @@ so traffic stops being routed to it, while `NoSchedule`/`PreferNoSchedule` only 
 the node. The taint's identity (key, value, effect) is immutable once the policy exists; delete and
 recreate the policy to change it. The taint is removed automatically once the condition clears.
 
+Every action is observable: the policy `status` reports the selected, matched, pending, held and
+remediated nodes, and the operator emits Kubernetes `Events` -- `TaintApplied`/`TaintRemoved`
+on both the affected node (`kubectl describe node`) and the policy (`kubectl describe nrp`), and
+`GuardTripped`/`InvalidSpec`/`MissingTransitionTime` on the policy -- alongside structured logs.
+
 ## Deploy
 
 The operator image is built and published to `ghcr.io/scality/node-warden-operator` by CI.

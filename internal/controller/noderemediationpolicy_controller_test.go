@@ -1,0 +1,503 @@
+/*
+Copyright 2026 Scality.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package controller
+
+import (
+	"time"
+
+	. "github.com/onsi/ginkgo/v2"
+	. "github.com/onsi/gomega"
+
+	corev1 "k8s.io/api/core/v1"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/util/workqueue"
+	"k8s.io/utils/ptr"
+	"sigs.k8s.io/controller-runtime/pkg/event"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+
+	wardenv1alpha1 "github.com/scality/node-warden-operator/api/v1alpha1"
+	"github.com/scality/node-warden-operator/internal/remediation"
+)
+
+const (
+	testConditionType   = "WPUnavailable"
+	testConditionStatus = "True"
+	testTaintKey        = "node.scality.io/wp-unreachable"
+	testTaintEffect     = "NoExecute"
+	testLabelValue      = "yes"
+)
+
+// findTaint returns the remediation taint (testTaintKey) and whether it was present. It is used
+// instead of asserting on the full taint list because envtest's TaintNodesByCondition
+// admission plugin auto-adds a node.kubernetes.io/not-ready taint to fresh Nodes.
+func findTaint(node *corev1.Node) (corev1.Taint, bool) {
+	for _, t := range node.Spec.Taints {
+		if t.Key == testTaintKey {
+			return t, true
+		}
+	}
+	return corev1.Taint{}, false
+}
+
+// invalidNodeSelector returns a selector that passes the CRD's structural validation but fails
+// metav1.LabelSelectorAsSelector (an unknown operator), used to exercise the invalid-spec paths.
+func invalidNodeSelector() *metav1.LabelSelector {
+	return &metav1.LabelSelector{
+		MatchExpressions: []metav1.LabelSelectorRequirement{{Key: "example.com/role", Operator: "Foo"}},
+	}
+}
+
+// drainQueue removes every request from the queue and returns the policy names, so a handler
+// spec can assert exactly which policies a Node event enqueued.
+func drainQueue(q workqueue.TypedRateLimitingInterface[reconcile.Request]) []string {
+	var names []string
+	for q.Len() > 0 {
+		item, _ := q.Get()
+		names = append(names, item.Name)
+		q.Done(item)
+	}
+	return names
+}
+
+var _ = Describe("NodeRemediationPolicy Controller", func() {
+	var reconciler *NodeRemediationPolicyReconciler
+
+	BeforeEach(func() {
+		reconciler = &NodeRemediationPolicyReconciler{
+			Client:    k8sClient,
+			APIReader: k8sClient,
+			Scheme:    k8sClient.Scheme(),
+		}
+	})
+
+	// createNode creates a Node carrying labelKey=labelVal and, via the status subresource, a
+	// single WPUnavailable condition with the given status and last-transition time.
+	createNode := func(name, labelKey, labelVal string, status corev1.ConditionStatus, transition time.Time) *corev1.Node {
+		node := &corev1.Node{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:   name,
+				Labels: map[string]string{labelKey: labelVal},
+			},
+		}
+		Expect(k8sClient.Create(ctx, node)).To(Succeed())
+		DeferCleanup(func() {
+			_ = k8sClient.Delete(ctx, node)
+		})
+
+		node.Status.Conditions = []corev1.NodeCondition{{
+			Type:               corev1.NodeConditionType(testConditionType),
+			Status:             status,
+			LastTransitionTime: metav1.NewTime(transition),
+		}}
+		Expect(k8sClient.Status().Update(ctx, node)).To(Succeed())
+		return node
+	}
+
+	// createPolicy creates a NodeRemediationPolicy selecting labelKey=yes. Debounce is set
+	// explicitly (60s enter / 30s exit) so the timing is deterministic and independent of the
+	// CRD defaults; the specs drive elapsed time via each node condition's LastTransitionTime.
+	createPolicy := func(name, labelKey string) {
+		policy := &wardenv1alpha1.NodeRemediationPolicy{
+			ObjectMeta: metav1.ObjectMeta{Name: name},
+			Spec: wardenv1alpha1.NodeRemediationPolicySpec{
+				NodeSelector: &metav1.LabelSelector{
+					MatchLabels: map[string]string{labelKey: testLabelValue},
+				},
+				Condition: wardenv1alpha1.ConditionMatch{Type: testConditionType, Status: testConditionStatus},
+				Remediations: wardenv1alpha1.Remediations{
+					Taint: &corev1.Taint{Key: testTaintKey, Effect: corev1.TaintEffectNoExecute},
+				},
+				Debounce: wardenv1alpha1.Debounce{
+					Enter: &metav1.Duration{Duration: 60 * time.Second},
+					Exit:  &metav1.Duration{Duration: 30 * time.Second},
+				},
+			},
+		}
+		Expect(k8sClient.Create(ctx, policy)).To(Succeed())
+		DeferCleanup(func() {
+			_ = k8sClient.Delete(ctx, policy)
+		})
+	}
+
+	reconcilePolicy := func(name string) reconcile.Result {
+		res, err := reconciler.Reconcile(ctx, reconcile.Request{
+			NamespacedName: types.NamespacedName{Name: name},
+		})
+		Expect(err).NotTo(HaveOccurred())
+		return res
+	}
+
+	// reconcileUntilStable reconciles a few times so the observational status converges
+	// (apply/remove happen on one pass; remediatedNodes reflects the taint on the next).
+	reconcileUntilStable := func(name string) {
+		for range 3 {
+			reconcilePolicy(name)
+		}
+	}
+
+	It("applies the taint when the condition holds past the enter debounce", func() {
+		const nodeName, policyName, labelKey = "node-apply", "policy-apply", "test/apply"
+
+		createNode(nodeName, labelKey, testLabelValue, corev1.ConditionTrue, time.Now().Add(-2*time.Minute))
+		createPolicy(policyName, labelKey)
+
+		By("marking the node pending on the first pass, before the taint is observed")
+		reconcilePolicy(policyName)
+		var pending wardenv1alpha1.NodeRemediationPolicy
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: policyName}, &pending)).To(Succeed())
+		Expect(pending.Status.SelectedNodes).To(ContainElement(nodeName))
+		Expect(pending.Status.PendingNodes).To(ContainElement(nodeName))
+		Expect(pending.Status.RemediatedNodes).NotTo(ContainElement(nodeName))
+
+		reconcileUntilStable(policyName)
+
+		By("adding our taint with NoExecute effect")
+		var node corev1.Node
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: nodeName}, &node)).To(Succeed())
+		taint, ok := findTaint(&node)
+		Expect(ok).To(BeTrue(), "expected node to carry the remediation taint")
+		Expect(taint.Effect).To(Equal(corev1.TaintEffectNoExecute))
+
+		By("reflecting the node in the policy status")
+		var policy wardenv1alpha1.NodeRemediationPolicy
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: policyName}, &policy)).To(Succeed())
+		Expect(policy.Status.SelectedNodes).To(ContainElement(nodeName))
+		Expect(policy.Status.MatchedNodes).To(ContainElement(nodeName))
+		Expect(policy.Status.RemediatedNodes).To(ContainElement(nodeName))
+
+		By("clearing pendingNodes once the node is remediated")
+		Expect(policy.Status.PendingNodes).To(BeEmpty())
+
+		cond := apimeta.FindStatusCondition(policy.Status.Conditions, wardenv1alpha1.ConditionRemediating)
+		Expect(cond).NotTo(BeNil())
+		Expect(cond.Status).To(Equal(metav1.ConditionTrue))
+		Expect(cond.ObservedGeneration).To(Equal(policy.Generation))
+	})
+
+	It("enqueues only the policies whose watched condition actually changed", func() {
+		const labelKey = "handlertest"
+		mkPolicy := func(name, condType string) {
+			policy := &wardenv1alpha1.NodeRemediationPolicy{
+				ObjectMeta: metav1.ObjectMeta{Name: name},
+				Spec: wardenv1alpha1.NodeRemediationPolicySpec{
+					NodeSelector: &metav1.LabelSelector{MatchLabels: map[string]string{labelKey: testLabelValue}},
+					Condition:    wardenv1alpha1.ConditionMatch{Type: condType, Status: testConditionStatus},
+					Remediations: wardenv1alpha1.Remediations{Taint: &corev1.Taint{Key: testTaintKey, Effect: corev1.TaintEffectNoExecute}},
+				},
+			}
+			Expect(k8sClient.Create(ctx, policy)).To(Succeed())
+			DeferCleanup(func() { _ = k8sClient.Delete(ctx, policy) })
+		}
+		mkPolicy("handler-wp", testConditionType)
+		mkPolicy("handler-disk", string(corev1.NodeDiskPressure))
+
+		nodeLabels := map[string]string{labelKey: testLabelValue}
+		oldNode := &corev1.Node{
+			ObjectMeta: metav1.ObjectMeta{Name: "handler-node", Labels: nodeLabels},
+			Status: corev1.NodeStatus{Conditions: []corev1.NodeCondition{
+				{Type: corev1.NodeConditionType(testConditionType), Status: corev1.ConditionTrue},
+				{Type: corev1.NodeDiskPressure, Status: corev1.ConditionFalse},
+			}},
+		}
+		newNode := oldNode.DeepCopy()
+		newNode.Status.Conditions[1].Status = corev1.ConditionTrue // only DiskPressure flips
+
+		queue := workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[reconcile.Request]())
+		reconciler.nodeEventHandler().Update(ctx, event.UpdateEvent{ObjectOld: oldNode, ObjectNew: newNode}, queue)
+
+		enqueued := drainQueue(queue)
+		Expect(enqueued).To(ContainElement("handler-disk"))
+		Expect(enqueued).NotTo(ContainElement("handler-wp"))
+	})
+
+	It("defaults the debounce windows to 60s/30s when omitted", func() {
+		policy := &wardenv1alpha1.NodeRemediationPolicy{
+			ObjectMeta: metav1.ObjectMeta{Name: "policy-debounce-default"},
+			Spec: wardenv1alpha1.NodeRemediationPolicySpec{
+				Condition: wardenv1alpha1.ConditionMatch{Type: testConditionType, Status: testConditionStatus},
+				Remediations: wardenv1alpha1.Remediations{
+					Taint: &corev1.Taint{Key: testTaintKey, Effect: corev1.TaintEffectNoExecute},
+				},
+			},
+		}
+		Expect(k8sClient.Create(ctx, policy)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, policy) })
+
+		var got wardenv1alpha1.NodeRemediationPolicy
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: policy.Name}, &got)).To(Succeed())
+		Expect(got.Spec.Debounce.Enter).NotTo(BeNil())
+		Expect(got.Spec.Debounce.Enter.Duration).To(Equal(60 * time.Second))
+		Expect(got.Spec.Debounce.Exit).NotTo(BeNil())
+		Expect(got.Spec.Debounce.Exit.Duration).To(Equal(30 * time.Second))
+	})
+
+	It("removes the taint when the condition clears past the exit debounce", func() {
+		const nodeName, policyName, labelKey = "node-remove", "policy-remove", "test/remove"
+
+		node := createNode(nodeName, labelKey, testLabelValue, corev1.ConditionFalse, time.Now().Add(-2*time.Minute))
+		createPolicy(policyName, labelKey)
+
+		By("seeding the node with the remediation taint")
+		_, seedErr := EnsureTaint(ctx, k8sClient, k8sClient, nodeName, remediation.Taint{Key: testTaintKey, Effect: testTaintEffect})
+		Expect(seedErr).NotTo(HaveOccurred())
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: nodeName}, node)).To(Succeed())
+		_, ok := findTaint(node)
+		Expect(ok).To(BeTrue(), "precondition: node should start tainted")
+
+		reconcileUntilStable(policyName)
+
+		By("removing our taint")
+		var got corev1.Node
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: nodeName}, &got)).To(Succeed())
+		_, ok = findTaint(&got)
+		Expect(ok).To(BeFalse(), "expected the remediation taint to be removed")
+
+		By("dropping the node from the policy status and reporting NoRemediation")
+		var policy wardenv1alpha1.NodeRemediationPolicy
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: policyName}, &policy)).To(Succeed())
+		Expect(policy.Status.RemediatedNodes).NotTo(ContainElement(nodeName))
+
+		cond := apimeta.FindStatusCondition(policy.Status.Conditions, wardenv1alpha1.ConditionRemediating)
+		Expect(cond).NotTo(BeNil())
+		Expect(cond.Status).To(Equal(metav1.ConditionFalse))
+		Expect(cond.Reason).To(Equal(wardenv1alpha1.ReasonNoRemediation))
+	})
+
+	It("holds the taint when the condition goes Unknown instead of removing it", func() {
+		const nodeName, policyName, labelKey = "node-unknown", "policy-unknown", "test/unknown"
+
+		createNode(nodeName, labelKey, testLabelValue, corev1.ConditionUnknown, time.Now().Add(-2*time.Minute))
+		createPolicy(policyName, labelKey)
+
+		By("seeding the node with the remediation taint")
+		_, seedErr := EnsureTaint(ctx, k8sClient, k8sClient, nodeName, remediation.Taint{Key: testTaintKey, Effect: testTaintEffect})
+		Expect(seedErr).NotTo(HaveOccurred())
+		var seeded corev1.Node
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: nodeName}, &seeded)).To(Succeed())
+		_, ok := findTaint(&seeded)
+		Expect(ok).To(BeTrue(), "precondition: node should start tainted")
+
+		reconcileUntilStable(policyName)
+
+		By("keeping the taint present (held, not removed)")
+		var got corev1.Node
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: nodeName}, &got)).To(Succeed())
+		_, ok = findTaint(&got)
+		Expect(ok).To(BeTrue(), "expected the remediation taint to be held while the condition is Unknown")
+
+		By("listing the node as unknown and still remediated")
+		var policy wardenv1alpha1.NodeRemediationPolicy
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: policyName}, &policy)).To(Succeed())
+		Expect(policy.Status.UnknownNodes).To(ContainElement(nodeName))
+		Expect(policy.Status.RemediatedNodes).To(ContainElement(nodeName))
+		Expect(policy.Status.MatchedNodes).NotTo(ContainElement(nodeName))
+		Expect(policy.Status.PendingNodes).NotTo(ContainElement(nodeName))
+	})
+
+	It("does not taint and requeues while the condition is still within the enter debounce", func() {
+		const nodeName, policyName, labelKey = "node-pending", "policy-pending", "test/pending"
+
+		createNode(nodeName, labelKey, testLabelValue, corev1.ConditionTrue, time.Now())
+		createPolicy(policyName, labelKey)
+
+		res := reconcilePolicy(policyName)
+
+		By("requeuing for the remaining debounce window")
+		Expect(res.RequeueAfter).To(BeNumerically(">", time.Duration(0)))
+
+		By("leaving the node untainted")
+		var node corev1.Node
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: nodeName}, &node)).To(Succeed())
+		_, ok := findTaint(&node)
+		Expect(ok).To(BeFalse(), "expected no remediation taint within the enter debounce")
+
+		By("reporting Pending (not NoRemediation) while the node awaits the debounce")
+		var policy wardenv1alpha1.NodeRemediationPolicy
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: policyName}, &policy)).To(Succeed())
+		Expect(policy.Status.PendingNodes).To(ContainElement(nodeName))
+		cond := apimeta.FindStatusCondition(policy.Status.Conditions, wardenv1alpha1.ConditionRemediating)
+		Expect(cond).NotTo(BeNil())
+		Expect(cond.Reason).To(Equal(wardenv1alpha1.ReasonPending))
+	})
+
+	It("only remediates nodes matched by the nodeSelector", func() {
+		const policyName, labelKey = "policy-scope", "test/scope"
+		const matchNode, otherNode = "node-scope-match", "node-scope-other"
+
+		createNode(matchNode, labelKey, testLabelValue, corev1.ConditionTrue, time.Now().Add(-2*time.Minute))
+		createNode(otherNode, labelKey, "no", corev1.ConditionTrue, time.Now().Add(-2*time.Minute))
+		createPolicy(policyName, labelKey)
+
+		reconcileUntilStable(policyName)
+
+		By("tainting only the matching node")
+		var matched corev1.Node
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: matchNode}, &matched)).To(Succeed())
+		_, ok := findTaint(&matched)
+		Expect(ok).To(BeTrue(), "matching node should be tainted")
+
+		var other corev1.Node
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: otherNode}, &other)).To(Succeed())
+		_, ok = findTaint(&other)
+		Expect(ok).To(BeFalse(), "non-matching node should not be tainted")
+
+		By("listing only the matching node in status")
+		var policy wardenv1alpha1.NodeRemediationPolicy
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: policyName}, &policy)).To(Succeed())
+		Expect(policy.Status.SelectedNodes).To(ConsistOf(matchNode))
+		Expect(policy.Status.MatchedNodes).To(ConsistOf(matchNode))
+		Expect(policy.Status.RemediatedNodes).To(ConsistOf(matchNode))
+	})
+
+	It("trips the guard and applies no taint when too many nodes match", func() {
+		const policyName, labelKey = "policy-guard", "test/guard"
+		nodeNames := []string{"node-guard-1", "node-guard-2", "node-guard-3"}
+		for _, n := range nodeNames {
+			createNode(n, labelKey, testLabelValue, corev1.ConditionTrue, time.Now().Add(-2*time.Minute))
+		}
+
+		policy := &wardenv1alpha1.NodeRemediationPolicy{
+			ObjectMeta: metav1.ObjectMeta{Name: policyName},
+			Spec: wardenv1alpha1.NodeRemediationPolicySpec{
+				NodeSelector: &metav1.LabelSelector{MatchLabels: map[string]string{labelKey: testLabelValue}},
+				Condition:    wardenv1alpha1.ConditionMatch{Type: testConditionType, Status: testConditionStatus},
+				Remediations: wardenv1alpha1.Remediations{
+					Taint: &corev1.Taint{Key: testTaintKey, Effect: corev1.TaintEffectNoExecute},
+				},
+				Guard: wardenv1alpha1.Guard{MaxAffectedPercent: ptr.To(int32(50))},
+			},
+		}
+		Expect(k8sClient.Create(ctx, policy)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, policy) })
+
+		reconcilePolicy(policyName)
+
+		By("leaving every matching node untainted")
+		for _, n := range nodeNames {
+			var node corev1.Node
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: n}, &node)).To(Succeed())
+			_, ok := findTaint(&node)
+			Expect(ok).To(BeFalse(), "guard should prevent tainting")
+		}
+
+		By("reporting GuardTripped in status")
+		var got wardenv1alpha1.NodeRemediationPolicy
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: policyName}, &got)).To(Succeed())
+		cond := apimeta.FindStatusCondition(got.Status.Conditions, wardenv1alpha1.ConditionRemediating)
+		Expect(cond).NotTo(BeNil())
+		Expect(cond.Status).To(Equal(metav1.ConditionFalse))
+		Expect(cond.Reason).To(Equal(wardenv1alpha1.ReasonGuardTripped))
+	})
+
+	It("trips the guard with two matching nodes at 50% and taints neither", func() {
+		const policyName, labelKey = "policy-guard2", "test/guard2"
+		nodeNames := []string{"node-g2-1", "node-g2-2"}
+		for _, n := range nodeNames {
+			createNode(n, labelKey, testLabelValue, corev1.ConditionTrue, time.Now().Add(-2*time.Minute))
+		}
+
+		policy := &wardenv1alpha1.NodeRemediationPolicy{
+			ObjectMeta: metav1.ObjectMeta{Name: policyName},
+			Spec: wardenv1alpha1.NodeRemediationPolicySpec{
+				NodeSelector: &metav1.LabelSelector{MatchLabels: map[string]string{labelKey: testLabelValue}},
+				Condition:    wardenv1alpha1.ConditionMatch{Type: testConditionType, Status: testConditionStatus},
+				Remediations: wardenv1alpha1.Remediations{
+					Taint: &corev1.Taint{Key: testTaintKey, Effect: corev1.TaintEffectNoExecute},
+				},
+				// 2 of 2 nodes match = 100% > 50% -> guard trips, nothing is applied.
+				Guard: wardenv1alpha1.Guard{MaxAffectedPercent: ptr.To(int32(50))},
+			},
+		}
+		Expect(k8sClient.Create(ctx, policy)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, policy) })
+
+		reconcileUntilStable(policyName)
+
+		By("tainting neither node")
+		for _, n := range nodeNames {
+			var node corev1.Node
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: n}, &node)).To(Succeed())
+			_, ok := findTaint(&node)
+			Expect(ok).To(BeFalse(), "guard should prevent tainting either node")
+		}
+
+		By("reporting GuardTripped")
+		var got wardenv1alpha1.NodeRemediationPolicy
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: policyName}, &got)).To(Succeed())
+		cond := apimeta.FindStatusCondition(got.Status.Conditions, wardenv1alpha1.ConditionRemediating)
+		Expect(cond).NotTo(BeNil())
+		Expect(cond.Status).To(Equal(metav1.ConditionFalse))
+		Expect(cond.Reason).To(Equal(wardenv1alpha1.ReasonGuardTripped))
+	})
+
+	It("marks the policy InvalidSpec and stops requeuing on an invalid nodeSelector", func() {
+		policy := &wardenv1alpha1.NodeRemediationPolicy{
+			ObjectMeta: metav1.ObjectMeta{Name: "policy-invalid"},
+			Spec: wardenv1alpha1.NodeRemediationPolicySpec{
+				NodeSelector: invalidNodeSelector(),
+				Condition:    wardenv1alpha1.ConditionMatch{Type: testConditionType, Status: testConditionStatus},
+				Remediations: wardenv1alpha1.Remediations{
+					Taint: &corev1.Taint{Key: testTaintKey, Effect: corev1.TaintEffectNoExecute},
+				},
+			},
+		}
+		Expect(k8sClient.Create(ctx, policy)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, policy) })
+
+		res := reconcilePolicy(policy.Name)
+
+		By("returning no error and no requeue")
+		Expect(res).To(Equal(reconcile.Result{}))
+
+		By("surfacing InvalidSpec in status")
+		var got wardenv1alpha1.NodeRemediationPolicy
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: policy.Name}, &got)).To(Succeed())
+		cond := apimeta.FindStatusCondition(got.Status.Conditions, wardenv1alpha1.ConditionRemediating)
+		Expect(cond).NotTo(BeNil())
+		Expect(cond.Status).To(Equal(metav1.ConditionFalse))
+		Expect(cond.Reason).To(Equal(wardenv1alpha1.ReasonInvalidSpec))
+	})
+
+	It("keeps the last-known node status when a working policy's spec becomes invalid", func() {
+		const nodeName, policyName, labelKey = "node-stale", "policy-stale", "test/stale"
+
+		createNode(nodeName, labelKey, testLabelValue, corev1.ConditionTrue, time.Now().Add(-2*time.Minute))
+		createPolicy(policyName, labelKey)
+		reconcileUntilStable(policyName)
+
+		By("first populating the status with a remediated node")
+		var populated wardenv1alpha1.NodeRemediationPolicy
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: policyName}, &populated)).To(Succeed())
+		Expect(populated.Status.RemediatedCount).To(BeNumerically(">", 0))
+
+		By("making the spec invalid")
+		populated.Spec.NodeSelector = invalidNodeSelector()
+		Expect(k8sClient.Update(ctx, &populated)).To(Succeed())
+		reconcilePolicy(policyName)
+
+		By("preserving the node lists so the orphaned taint stays visible under an InvalidSpec condition")
+		var got wardenv1alpha1.NodeRemediationPolicy
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: policyName}, &got)).To(Succeed())
+		Expect(got.Status.RemediatedNodes).To(ContainElement(nodeName))
+		Expect(got.Status.RemediatedCount).To(BeNumerically(">", 0))
+		cond := apimeta.FindStatusCondition(got.Status.Conditions, wardenv1alpha1.ConditionRemediating)
+		Expect(cond).NotTo(BeNil())
+		Expect(cond.Reason).To(Equal(wardenv1alpha1.ReasonInvalidSpec))
+	})
+})
