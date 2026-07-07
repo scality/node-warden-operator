@@ -1,35 +1,57 @@
 {
-  "name": "Kubebuilder DevContainer",
-  "image": "golang:1.26",
+  "name": "Node Warden Operator",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "options": [
+      "--platform=linux/amd64"
+    ]
+  },
   "features": {
-    "ghcr.io/devcontainers/features/docker-in-docker:2": {
-      "moby": false,
-      "dockerDefaultAddressPool": "base=172.30.0.0/16,size=24"
-    },
-    "ghcr.io/devcontainers/features/git:1": {},
-    "ghcr.io/devcontainers/features/common-utils:2": {
-      "upgradePackages": true
+    "ghcr.io/devcontainers/features/sshd:1": {},
+    "ghcr.io/devcontainers/features/github-cli:1": {},
+    "ghcr.io/devcontainers/features/docker-in-docker:3": {
+      "dockerDashComposeVersion": "none",
+      "moby": false
     }
   },
-
   "runArgs": ["--privileged", "--init"],
-
   "customizations": {
     "vscode": {
-      "settings": {
-        "terminal.integrated.shell.linux": "/bin/bash"
-      },
       "extensions": [
+        // Create TODO and FIXME tree
+        "Gruntfuggly.todo-tree",
+        // Go support
+        "golang.go",
+        // Remote container support
+        "ms-vscode-remote.remote-containers",
+        // YAML support
+        "redhat.vscode-yaml",
+        // Github Action helper
+        "github.vscode-github-actions",
+        // Docker helper
+        "ms-azuretools.vscode-docker",
+        // Kubernetes helper
         "ms-kubernetes-tools.vscode-kubernetes-tools",
-        "ms-azuretools.vscode-docker"
-      ]
+        // Markdown support
+        "yzhang.markdown-all-in-one",
+        // Compare text selections
+        "ryu1kn.partial-diff",
+        // Ginkgo support
+        "joselitofilho.ginkgotestexplorer"
+      ],
+      "settings": {
+        "telemetry.telemetryLevel": "off",
+        "redhat.telemetry.enabled": false,
+        "editor.renderWhitespace": "all",
+        "terminal.integrated.profiles.linux": {
+          "zsh": {
+            "path": "/usr/bin/zsh"
+          }
+        },
+        "terminal.integrated.defaultProfile.linux": "zsh",
+        "python.terminal.activateEnvironment": false
+      }
     }
   },
-
-  "remoteEnv": {
-    "GO111MODULE": "on"
-  },
-
-  "onCreateCommand": "bash .devcontainer/post-install.sh"
+  "remoteUser": "vscode"
 }
-
