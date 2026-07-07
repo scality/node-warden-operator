@@ -12,8 +12,8 @@ detail once the behavior lands; this doc keeps that part high-level on purpose.
 - Provide a generic, declarative `NodeRemediationPolicy` CRD that maps any node condition to
   remediation(s), so a new condition or use case is covered by adding a CR, not by changing
   code.
-- Ship a v1 remediation (a reversible `NoExecute` taint) that is safe enough to run against
-  production nodes: debounced against flapping, guarded against over-triggering on a
+- Ship a v1 remediation (a reversible taint, effect chosen by the policy) that is safe enough to
+  run against production nodes: debounced against flapping, guarded against over-triggering on a
   cluster-wide event, and self-healing once the condition clears.
 
 ## Non-goals
@@ -81,16 +81,25 @@ unit tests against `Decide`, not by cluster-dependent tests against the controll
 
 ## Notable decisions
 
-- **Validation via CEL.** The CRD's invariants (e.g. `taint.effect` restricted to
-  `NoExecute`, `guard.maxAffectedFraction` in `[0,1]`, at least one remediation set) are
-  expressed as CEL validation rules on the schema, so no admission webhook is needed today.
-  One can still be added later if a check outgrows what CEL can express.
+- **Validation via CEL.** The CRD's invariants -- `taint.effect` restricted to a real Kubernetes
+  taint effect, `taint.key` a valid qualified name (otherwise every node patch is rejected),
+  `debounce.enter`/`exit` a non-negative Go duration (otherwise decode stalls the reconcile), and
+  at least one remediation set -- are expressed as CEL validation rules on the schema, so no
+  admission webhook is needed today. One can still be added later if a check outgrows what CEL can
+  express.
 - **Read-modify-write, not Server-Side Apply, for taints.** `node.spec.taints` is a plain
   list on the `Node` object, which node-warden does not own. To avoid clobbering taints set by
   anything else, the controller reads the node, adds or removes only the taint(s) whose key
   matches its own policy, and writes back with conflict retry, rather than server-side-applying
   a list it does not fully own.
-- **The remediation taint is `NoExecute` and reversible.** It evicts only pods that do not
-  tolerate it; kubelet-managed static pods are unaffected, and workloads that must keep
-  running on a remediated node can be given a matching toleration. Removing the taint restores
-  normal scheduling.
+- **The remediation taint is reversible; its effect is the policy's choice.** `effect` is
+  validated to a real Kubernetes taint effect (`NoSchedule`, `PreferNoSchedule`, `NoExecute`), so
+  an invalid value is rejected at admission instead of failing every `Node` update. `NoExecute`
+  evicts pods that do not tolerate it (kubelet-managed static pods are unaffected; workloads that
+  must keep running can carry a matching toleration); the softer effects only stop new
+  scheduling. Removing the taint restores normal scheduling.
+- **The taint is immutable once set.** A CEL transition rule (`self == oldSelf`) rejects any
+  change to `remediations.taint` on an existing policy. The operator tracks and removes the taint
+  by its identity, so allowing the key, value or effect to change would orphan the taint already
+  applied; keeping it immutable means observe/apply/remove stay keyed on a single, stable
+  identity. Changing the remediation means deleting and recreating the policy.

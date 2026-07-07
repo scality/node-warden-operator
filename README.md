@@ -11,9 +11,11 @@ A cluster-scoped Kubernetes operator that reacts to node conditions and remediat
 
 node-warden watches Kubernetes Node conditions and remediates affected nodes. It is driven by
 a generic `NodeRemediationPolicy` custom resource (cluster-scoped) that maps a node condition
-to one or more remediations. For v1, the only remediation is a reversible `NoExecute` taint:
-applying it evicts non-tolerating pods and removes the node from Service endpoints, so traffic
-stops being routed to it; the taint is removed automatically once the condition clears.
+to one or more remediations. For v1, the only remediation is a reversible taint whose effect the
+policy chooses: `NoExecute` evicts non-tolerating pods and drops the node from Service endpoints,
+so traffic stops being routed to it, while `NoSchedule`/`PreferNoSchedule` only keep new pods off
+the node. The taint's identity (key, value, effect) is immutable once the policy exists; delete and
+recreate the policy to change it. The taint is removed automatically once the condition clears.
 
 ## Deploy
 
