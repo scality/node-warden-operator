@@ -1,0 +1,62 @@
+name: "Build"
+
+on:
+  workflow_call:
+    inputs:
+      is-development:
+        description: "Whether the build is for development purposes or not"
+        required: false
+        default: true
+        type: boolean
+      is-latest:
+        description: "Whether the build is for the latest tag or not"
+        required: false
+        default: false
+        type: boolean
+      is-stable:
+        description: "Whether the build is for a stable release or not"
+        required: false
+        default: false
+        type: boolean
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          # NOTE: We fetch depth so that we can put the right `GIT` reference
+          fetch-depth: 0
+          ref: ${{ github.ref }}
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+      - name: Login to the registry
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Compute tags
+        id: tags
+        # If `is-development` then suffix tag with `-dev`
+        # If `is-latest` then add `latest` tag
+        # If not `is-stable` then suffix `-dev` to `latest
+        run: |
+          version="$(git describe --tags --always --dirty --match='v[0-9]*')${{ inputs.is-development && '-dev' || '' }}"
+          tags="ghcr.io/${{ github.repository }}:${version}"
+          if [ "${{ inputs.is-latest }}" = "true" ]; then
+            tags="$tags,ghcr.io/${{ github.repository }}:latest${{ ! inputs.is-stable && '-dev' || '' }}"
+          fi
+          echo "tags=$tags" >> $GITHUB_OUTPUT
+          echo "version=$version" >> $GITHUB_OUTPUT
+      - name: Build image
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+        with:
+          context: .
+          build-args:
+            VERSION=${{ steps.tags.outputs.version }}
+          push: true
+          tags: ${{ steps.tags.outputs.tags }}
+          cache-from: type=gha,scope=node-warden-operator
+          cache-to: type=gha,mode=max,scope=node-warden-operator

@@ -1,0 +1,15 @@
+name: "Post Merge"
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  build:
+    uses: ./.github/workflows/build.yaml
+    secrets: inherit
+    with:
+      is-development: false
+      is-latest: true
+      is-stable: false
