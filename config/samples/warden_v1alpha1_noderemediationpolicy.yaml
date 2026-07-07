@@ -1,0 +1,9 @@
+apiVersion: warden.scality.com/v1alpha1
+kind: NodeRemediationPolicy
+metadata:
+  labels:
+    app.kubernetes.io/name: node-warden-operator
+    app.kubernetes.io/managed-by: kustomize
+  name: noderemediationpolicy-sample
+spec:
+  # TODO(user): Add fields here
