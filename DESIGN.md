@@ -2,7 +2,7 @@
 
 Design overview for node-warden-operator. This is the root design
 doc: goals, architecture, and the decisions behind them. The full reconcile mechanics
-(predicate specifics, the debounce state machine, the guard-fraction math) are written up in
+(predicate specifics, the debounce state machine, the guard-percentage math) are written up in
 detail once the behavior lands; this doc keeps that part high-level on purpose.
 
 ## Goals
@@ -32,14 +32,14 @@ detail once the behavior lands; this doc keeps that part high-level on purpose.
 
 node-warden separates the decision from the I/O:
 
-- A pure `Decide(facts, now) -> Plan` function holds all the decision logic (condition
-  matching, `nodeSelector` matching, debounce, guard fraction). It performs no I/O.
+- A pure `Decide(facts, now) -> Decision` function holds all the decision logic (condition
+  matching, `nodeSelector` matching, debounce, guard percentage). It performs no I/O.
 - A thin controller shell wraps it: gather facts from the cluster (OBSERVE), call `Decide`
-  (DECIDE), and apply the resulting plan (ACT).
+  (DECIDE), and apply the resulting decision (ACT).
 
 Keeping the decision pure is what makes the tricky parts testable: the debounce state machine,
-the guard fraction, and `Unknown`/stale handling are all covered by plain table-driven unit
-tests that construct facts and assert on the returned plan, with no cluster or envtest needed.
+the guard percentage, and `Unknown`/stale handling are all covered by plain table-driven unit
+tests that construct facts and assert on the returned decision, with no cluster or envtest needed.
 The shell stays small, so a handful of integration tests cover the wiring.
 
 Directory sketch:
@@ -49,8 +49,8 @@ api/v1alpha1/          NodeRemediationPolicy types + CEL validation + deepcopy
 cmd/main.go            composition root: scheme, manager, watches wiring
 config/                CRD, RBAC, manager, samples (example NodeRemediationPolicy manifests)
 internal/
-  remediation/         pure core: Decide(facts, now) -> Plan
-                        (condition match, nodeSelector, debounce state machine, guard fraction)
+  remediation/         pure core: Decide(facts, now) -> Decision
+                        (condition match, nodeSelector, debounce state machine, guard percentage)
   controller/          thin shell: OBSERVE -> DECIDE -> ACT (taint apply/remove, status once)
   predicate/           conditionStatusChanged, label-changed, generation-changed
 hack/
@@ -60,7 +60,7 @@ test/                  envtest + e2e (kind)
 ## Reconcile model: OBSERVE -> DECIDE -> ACT
 
 High level only here; a fuller write-up of the mechanics (predicate specifics, the
-debounce-via-`lastTransitionTime` state machine, the guard-fraction math) lands with the
+debounce-via-`lastTransitionTime` state machine, the guard-percentage math) lands with the
 behavior itself.
 
 - **OBSERVE**: the controller watches `Node` and `NodeRemediationPolicy` objects through
@@ -69,10 +69,10 @@ behavior itself.
   can actually affect a decision. It then gathers read-only facts: the policies, and per node
   its conditions (with `lastTransitionTime`), labels, and current taints.
 - **DECIDE**: the facts and the current time are passed to the pure `Decide` function, which
-  evaluates each policy against the nodes it selects and returns a `Plan` -- which taints to
+  evaluates each policy against the nodes it selects and returns a `Decision` -- which taints to
   add or remove, the status to write per policy, and when to requeue.
-- **ACT**: the shell applies the plan (taint add/remove on the matched nodes) and writes each
-  policy's status exactly once, then requeues if the plan asks for it (e.g. to re-check a
+- **ACT**: the shell applies the decision (taint add/remove on the matched nodes) and writes each
+  policy's status exactly once, then requeues if it asks for it (e.g. to re-check a
   pending debounce window later).
 
 Because the decision is pure, edge cases -- flapping, a partial outage over the guard,
