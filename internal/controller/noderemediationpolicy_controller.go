@@ -34,6 +34,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -58,10 +59,16 @@ type NodeRemediationPolicyReconciler struct {
 }
 
 var (
-	ErrProjectPolicy = errors.New("project NodeRemediationPolicy")
-	ErrListNodes     = errors.New("list nodes")
-	ErrWriteStatus   = errors.New("write NodeRemediationPolicy status")
+	ErrProjectPolicy   = errors.New("project NodeRemediationPolicy")
+	ErrListNodes       = errors.New("list nodes")
+	ErrWriteStatus     = errors.New("write NodeRemediationPolicy status")
+	ErrEnsureFinalizer = errors.New("ensure NodeRemediationPolicy finalizer")
+	ErrRemoveFinalizer = errors.New("remove NodeRemediationPolicy finalizer")
 )
+
+// taintCleanupFinalizer keeps a deleted policy around until the operator has removed the taints it
+// applied, so deleting a policy does not leave nodes tainted forever.
+const taintCleanupFinalizer = "warden.scality.com/taint-cleanup"
 
 // Event reasons recorded on the affected nodes. Policy-level decisions reuse the status condition
 // reasons (wardenv1alpha1.ReasonGuardTripped, ReasonInvalidSpec) so the event and the condition
@@ -85,6 +92,30 @@ func (r *NodeRemediationPolicyReconciler) Reconcile(ctx context.Context, req ctr
 	var policy wardenv1alpha1.NodeRemediationPolicy
 	if err := r.Get(ctx, req.NamespacedName, &policy); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
+
+	// Finalizer: deleting a policy must remove the taints it applied instead of stranding them on
+	// the nodes. Register the finalizer while the policy is live, and run the cleanup on deletion
+	// before letting the object go.
+	if policy.DeletionTimestamp.IsZero() {
+		if !controllerutil.ContainsFinalizer(&policy, taintCleanupFinalizer) {
+			controllerutil.AddFinalizer(&policy, taintCleanupFinalizer)
+			if err := r.Update(ctx, &policy); err != nil {
+				return ctrl.Result{}, errors.Wrap(ErrEnsureFinalizer, errors.WithProperty("policy", policy.Name), errors.CausedBy(err))
+			}
+		}
+	} else {
+		if controllerutil.ContainsFinalizer(&policy, taintCleanupFinalizer) {
+			if err := r.cleanupTaints(ctx, &policy); err != nil {
+				return ctrl.Result{}, err
+			}
+			controllerutil.RemoveFinalizer(&policy, taintCleanupFinalizer)
+			if err := r.Update(ctx, &policy); err != nil {
+				return ctrl.Result{}, errors.Wrap(ErrRemoveFinalizer, errors.WithProperty("policy", policy.Name), errors.CausedBy(err))
+			}
+		}
+		// Stop reconciliation: the object is being deleted.
+		return ctrl.Result{}, nil
 	}
 
 	original := policy.DeepCopy()
@@ -197,6 +228,49 @@ func (r *NodeRemediationPolicyReconciler) Reconcile(ctx context.Context, req ctr
 		return ctrl.Result{}, err
 	}
 	return ctrl.Result{RequeueAfter: decision.RequeueAfter}, nil
+}
+
+// cleanupTaints removes the policy's taint from every node that still carries it, so deleting the
+// policy does not strand taints. It is idempotent and safe to call repeatedly. It works off the
+// immutable taint key taken straight from the spec -- deliberately NOT projectPolicy, whose
+// nodeSelector parse could fail and strand the taint, since the selector is irrelevant when
+// removing a taint by key everywhere. Transient list/patch errors are returned so the finalizer
+// retries. To be resilient to a just-applied taint not yet in the cache, it reads nodes uncached.
+func (r *NodeRemediationPolicyReconciler) cleanupTaints(ctx context.Context, policy *wardenv1alpha1.NodeRemediationPolicy) error {
+	taintSpec := policy.Spec.Remediations.Taint
+	if taintSpec == nil {
+		return nil // no taint remediation, so nothing this policy could have applied
+	}
+	// Just what the removal and its event need, without parsing the selector.
+	pure := remediation.Policy{
+		Taint:           taintFromSpec(taintSpec),
+		ConditionType:   policy.Spec.Condition.Type,
+		ConditionStatus: policy.Spec.Condition.StatusOrDefault(),
+	}
+	var nodeList corev1.NodeList
+	if err := r.APIReader.List(ctx, &nodeList); err != nil {
+		return errors.Wrap(ErrListNodes, errors.CausedBy(err))
+	}
+	logger := logf.FromContext(ctx)
+	// Like the ACT loop, a per-node failure must not abort the cleanup: aggregate and keep going,
+	// otherwise one churning node would leave the others tainted and block the finalizer forever.
+	var errs []error
+	for i := range nodeList.Items {
+		node := &nodeList.Items[i]
+		if !hasTaintKey(node, pure.Taint.Key) {
+			continue
+		}
+		changed, err := RemoveTaint(ctx, r.Client, r.APIReader, node.Name, pure.Taint.Key)
+		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		if changed {
+			logger.Info("removed remediation taint on policy deletion", "node", node.Name, "key", pure.Taint.Key)
+			r.recordTaintAction(node, policy, reasonTaintRemoved, pure, node.Name)
+		}
+	}
+	return utilerrors.NewAggregate(errs)
 }
 
 // recordTaintAction emits a taint apply/remove event on both the affected node (so it shows in

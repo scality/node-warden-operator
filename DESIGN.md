@@ -95,6 +95,13 @@ unit tests against `Decide`, not by cluster-dependent tests against the controll
   anything else, the controller reads the node, adds or removes only the taint(s) whose key
   matches its own policy, and writes back with conflict retry, rather than server-side-applying
   a list it does not fully own.
+- **A policy's `taint.key` is its identity, and must be unique across policies.** node-warden
+  tracks and cleans up its taint purely by `key` -- it does not tag ownership -- so two policies
+  that share a `taint.key` interfere: each removes that key from every node it does not select, so
+  one policy strips the taint another legitimately applied, and the node flaps. CEL cannot enforce
+  uniqueness across objects, so for v1 this is a documented operator constraint; a future
+  validating webhook can reject a duplicate key (and the exact key/duration limits CEL only
+  approximates) at admission.
 - **The remediation taint is reversible; its effect is the policy's choice.** `effect` is
   validated to a real Kubernetes taint effect (`NoSchedule`, `PreferNoSchedule`, `NoExecute`), so
   an invalid value is rejected at admission instead of failing every `Node` update. `NoExecute`
@@ -105,7 +112,13 @@ unit tests against `Decide`, not by cluster-dependent tests against the controll
   change to `remediations.taint` on an existing policy. The operator tracks and removes the taint
   by its identity, so allowing the key, value or effect to change would orphan the taint already
   applied; keeping it immutable means observe/apply/remove stay keyed on a single, stable
-  identity. Changing the remediation means deleting and recreating the policy.
+  identity. Changing the remediation means deleting and recreating the policy (the finalizer
+  cleans up first).
+- **A finalizer removes the taints on deletion.** Deleting a policy must not strand its taints on
+  the nodes, so the operator sets a finalizer and, on deletion, removes every taint carrying the
+  policy's key before letting the object go. This is also why the policy watch carries no
+  generation-changed predicate: a deletion sets `deletionTimestamp` without bumping generation, and
+  the loop must still wake to run the cleanup.
 - **Events go on the object each fact is about.** A per-node action (`TaintApplied`,
   `TaintRemoved`) is recorded on both the affected `Node` -- so `kubectl describe node` explains
   why the node is tainted, like the node-lifecycle controllers do -- and on the policy. A

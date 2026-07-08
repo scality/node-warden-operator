@@ -25,6 +25,7 @@ import (
 	. "github.com/onsi/gomega"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -658,5 +659,109 @@ var _ = Describe("NodeRemediationPolicy Controller", func() {
 		cond := apimeta.FindStatusCondition(got.Status.Conditions, wardenv1alpha1.ConditionRemediating)
 		Expect(cond).NotTo(BeNil())
 		Expect(cond.Reason).To(Equal(wardenv1alpha1.ReasonInvalidSpec))
+	})
+
+	It("removes the applied taints and the finalizer when the policy is deleted", func() {
+		const nodeName, policyName, labelKey = "node-final", "policy-final", "test/final"
+
+		createNode(nodeName, labelKey, testLabelValue, corev1.ConditionTrue, time.Now().Add(-2*time.Minute))
+		createPolicy(policyName, labelKey)
+		reconcileUntilStable(policyName)
+
+		By("tainting the node and installing the finalizer")
+		var node corev1.Node
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: nodeName}, &node)).To(Succeed())
+		_, ok := findTaint(&node)
+		Expect(ok).To(BeTrue(), "node should be tainted before deletion")
+		var got wardenv1alpha1.NodeRemediationPolicy
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: policyName}, &got)).To(Succeed())
+		Expect(got.Finalizers).To(ContainElement(taintCleanupFinalizer))
+
+		By("deleting the policy, which only sets a deletionTimestamp while the finalizer is held")
+		Expect(k8sClient.Delete(ctx, &got)).To(Succeed())
+		reconcilePolicy(policyName)
+
+		By("removing the remediation taint from the node")
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: nodeName}, &node)).To(Succeed())
+		_, ok = findTaint(&node)
+		Expect(ok).To(BeFalse(), "taint must be cleaned up on deletion")
+
+		By("letting the object be garbage-collected once the finalizer is gone")
+		err := k8sClient.Get(ctx, types.NamespacedName{Name: policyName}, &got)
+		Expect(apierrors.IsNotFound(err)).To(BeTrue(), "policy should be gone after finalizer removal")
+	})
+
+	It("still removes the taint on deletion when the nodeSelector has become invalid", func() {
+		const nodeName, policyName, labelKey = "node-final-inval", "policy-final-inval", "test/finalinval"
+
+		createNode(nodeName, labelKey, testLabelValue, corev1.ConditionTrue, time.Now().Add(-2*time.Minute))
+		createPolicy(policyName, labelKey)
+		reconcileUntilStable(policyName)
+
+		By("tainting the node")
+		var node corev1.Node
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: nodeName}, &node)).To(Succeed())
+		_, ok := findTaint(&node)
+		Expect(ok).To(BeTrue())
+
+		By("breaking the nodeSelector (parses at admission, fails at LabelSelectorAsSelector)")
+		var policy wardenv1alpha1.NodeRemediationPolicy
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: policyName}, &policy)).To(Succeed())
+		policy.Spec.NodeSelector = invalidNodeSelector()
+		Expect(k8sClient.Update(ctx, &policy)).To(Succeed())
+
+		By("deleting the policy and reconciling")
+		Expect(k8sClient.Delete(ctx, &policy)).To(Succeed())
+		reconcilePolicy(policyName)
+
+		By("cleaning up the taint by key despite the unparseable selector")
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: nodeName}, &node)).To(Succeed())
+		_, ok = findTaint(&node)
+		Expect(ok).To(BeFalse(), "finalizer must clean up by key, not depend on the selector")
+		err := k8sClient.Get(ctx, types.NamespacedName{Name: policyName}, &policy)
+		Expect(apierrors.IsNotFound(err)).To(BeTrue())
+	})
+
+	It("keeps the finalizer and retries when a node's cleanup fails on deletion", func() {
+		const goodNode, badNode = "node-fin-good", "node-fin-bad"
+		const policyName, labelKey = "policy-fin-partial", "test/finpartial"
+
+		createNode(goodNode, labelKey, testLabelValue, corev1.ConditionTrue, time.Now().Add(-2*time.Minute))
+		createNode(badNode, labelKey, testLabelValue, corev1.ConditionTrue, time.Now().Add(-2*time.Minute))
+		createPolicy(policyName, labelKey)
+		reconcileUntilStable(policyName)
+
+		By("tainting both nodes and installing the finalizer")
+		for _, n := range []string{goodNode, badNode} {
+			var node corev1.Node
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: n}, &node)).To(Succeed())
+			_, ok := findTaint(&node)
+			Expect(ok).To(BeTrue())
+		}
+
+		By("deleting the policy, then reconciling with one node's cleanup failing")
+		var got wardenv1alpha1.NodeRemediationPolicy
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: policyName}, &got)).To(Succeed())
+		Expect(k8sClient.Delete(ctx, &got)).To(Succeed())
+		r := newFailingReconciler(badNode)
+		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: policyName}})
+		Expect(err).To(HaveOccurred(), "a failed cleanup must surface so the deletion is retried")
+
+		By("cleaning up the healthy node but keeping the policy (finalizer held) until cleanup completes")
+		var good corev1.Node
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: goodNode}, &good)).To(Succeed())
+		_, ok := findTaint(&good)
+		Expect(ok).To(BeFalse(), "the healthy node must be cleaned up despite the other failing")
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: policyName}, &got)).To(Succeed())
+		Expect(got.Finalizers).To(ContainElement(taintCleanupFinalizer), "finalizer must stay until every taint is gone")
+
+		By("completing the cleanup on a later pass once the failure clears")
+		reconcilePolicy(policyName)
+		var bad corev1.Node
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: badNode}, &bad)).To(Succeed())
+		_, ok = findTaint(&bad)
+		Expect(ok).To(BeFalse())
+		err = k8sClient.Get(ctx, types.NamespacedName{Name: policyName}, &got)
+		Expect(apierrors.IsNotFound(err)).To(BeTrue(), "policy should be gone once cleanup fully succeeds")
 	})
 })
