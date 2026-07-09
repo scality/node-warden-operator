@@ -1,0 +1,57 @@
+{
+  "name": "Node Warden Operator",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "options": [
+      "--platform=linux/amd64"
+    ]
+  },
+  "features": {
+    "ghcr.io/devcontainers/features/sshd:1": {},
+    "ghcr.io/devcontainers/features/github-cli:1": {},
+    "ghcr.io/devcontainers/features/docker-in-docker:3": {
+      "dockerDashComposeVersion": "none",
+      "moby": false
+    }
+  },
+  "runArgs": ["--privileged", "--init"],
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        // Create TODO and FIXME tree
+        "Gruntfuggly.todo-tree",
+        // Go support
+        "golang.go",
+        // Remote container support
+        "ms-vscode-remote.remote-containers",
+        // YAML support
+        "redhat.vscode-yaml",
+        // Github Action helper
+        "github.vscode-github-actions",
+        // Docker helper
+        "ms-azuretools.vscode-docker",
+        // Kubernetes helper
+        "ms-kubernetes-tools.vscode-kubernetes-tools",
+        // Markdown support
+        "yzhang.markdown-all-in-one",
+        // Compare text selections
+        "ryu1kn.partial-diff",
+        // Ginkgo support
+        "joselitofilho.ginkgotestexplorer"
+      ],
+      "settings": {
+        "telemetry.telemetryLevel": "off",
+        "redhat.telemetry.enabled": false,
+        "editor.renderWhitespace": "all",
+        "terminal.integrated.profiles.linux": {
+          "zsh": {
+            "path": "/usr/bin/zsh"
+          }
+        },
+        "terminal.integrated.defaultProfile.linux": "zsh",
+        "python.terminal.activateEnvironment": false
+      }
+    }
+  },
+  "remoteUser": "vscode"
+}
