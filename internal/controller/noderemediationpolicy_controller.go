@@ -24,16 +24,19 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
+	"k8s.io/client-go/tools/events"
 	"k8s.io/client-go/util/workqueue"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
@@ -51,6 +54,7 @@ type NodeRemediationPolicyReconciler struct {
 	// conflict retry so they see the current resourceVersion, not a stale cached one.
 	APIReader client.Reader
 	Scheme    *runtime.Scheme
+	Recorder  events.EventRecorder
 }
 
 var (
@@ -59,10 +63,20 @@ var (
 	ErrWriteStatus   = errors.New("write NodeRemediationPolicy status")
 )
 
+// Event reasons recorded on the affected nodes. Policy-level decisions reuse the status condition
+// reasons (wardenv1alpha1.ReasonGuardTripped, ReasonInvalidSpec) so the event and the condition
+// cannot drift apart.
+const (
+	reasonTaintApplied          = "TaintApplied"
+	reasonTaintRemoved          = "TaintRemoved"
+	reasonMissingTransitionTime = "MissingTransitionTime"
+)
+
 // +kubebuilder:rbac:groups=warden.scality.com,resources=noderemediationpolicies,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=warden.scality.com,resources=noderemediationpolicies/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=warden.scality.com,resources=noderemediationpolicies/finalizers,verbs=update
 // +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list;watch;update;patch
+// +kubebuilder:rbac:groups=events.k8s.io,resources=events,verbs=create;patch
 
 // Reconcile runs the observe/decide/act loop for one NodeRemediationPolicy: it observes the
 // selected nodes, delegates the decision to the pure core, enacts the taint changes and writes
@@ -78,10 +92,18 @@ func (r *NodeRemediationPolicyReconciler) Reconcile(ctx context.Context, req ctr
 		if equality.Semantic.DeepEqual(original.Status, policy.Status) {
 			return
 		}
-		if err := client.IgnoreNotFound(r.Status().Patch(ctx, &policy, client.MergeFrom(original))); err != nil && retErr == nil {
-			retErr = errors.Wrap(ErrWriteStatus, errors.WithProperty("policy", policy.Name), errors.CausedBy(err))
+		if err := client.IgnoreNotFound(r.Status().Patch(ctx, &policy, client.MergeFrom(original))); err != nil {
+			// Surface the status-write failure even when a taint error already set retErr: a dropped
+			// status write is otherwise invisible and would let the edge-triggered events re-fire on
+			// the retry. The taint error keeps precedence as the returned error.
+			logf.FromContext(ctx).Error(err, "writing NodeRemediationPolicy status", "policy", policy.Name)
+			if retErr == nil {
+				retErr = errors.Wrap(ErrWriteStatus, errors.WithProperty("policy", policy.Name), errors.CausedBy(err))
+			}
 		}
 	}()
+
+	logger := logf.FromContext(ctx)
 
 	// OBSERVE
 	pure, err := projectPolicy(&policy)
@@ -90,6 +112,11 @@ func (r *NodeRemediationPolicyReconciler) Reconcile(ctx context.Context, req ctr
 		// Keep the last observed node lists: the spec can no longer be projected, so any taint
 		// already applied cannot be reconciled or removed, and blanking the status would hide the
 		// nodes still carrying it. The InvalidSpec condition explains why they are stuck.
+		// Edge-trigger the log/event on the condition change so the settle pass does not repeat them.
+		if !equality.Semantic.DeepEqual(original.Status, policy.Status) {
+			logger.Error(err, "invalid policy spec")
+			r.Recorder.Eventf(&policy, nil, corev1.EventTypeWarning, wardenv1alpha1.ReasonInvalidSpec, "RejectSpec", "invalid spec: %v", err)
+		}
 		// Permanent configuration error: do not requeue; a spec change re-triggers reconcile.
 		return ctrl.Result{}, nil
 	}
@@ -97,7 +124,7 @@ func (r *NodeRemediationPolicyReconciler) Reconcile(ctx context.Context, req ctr
 	if err := r.List(ctx, &nodeList); err != nil {
 		return ctrl.Result{}, errors.Wrap(ErrListNodes, errors.CausedBy(err))
 	}
-	facts := observeNodes(nodeList.Items, pure)
+	facts, nodesByName := observeNodes(nodeList.Items, pure)
 
 	// DECIDE (pure)
 	decision := remediation.Decide(pure, facts, time.Now())
@@ -108,17 +135,61 @@ func (r *NodeRemediationPolicyReconciler) Reconcile(ctx context.Context, req ctr
 	// node would strand a healthy node's taint (leaving it cordoned/evicting).
 	var taintErrs []error
 	for _, name := range decision.ApplyTaint {
-		if _, err := EnsureTaint(ctx, r.Client, r.APIReader, name, pure.Taint); err != nil {
+		changed, err := EnsureTaint(ctx, r.Client, r.APIReader, name, pure.Taint)
+		if err != nil {
 			taintErrs = append(taintErrs, err)
+			continue
 		}
+		if !changed {
+			continue // taint already present (cache lag / external actor): no event
+		}
+		logger.Info("applied remediation taint", "node", name, "key", pure.Taint.Key, "effect", pure.Taint.Effect)
+		r.recordTaintAction(nodesByName[name], &policy, reasonTaintApplied, pure, name)
 	}
 	for _, name := range decision.RemoveTaint {
-		if _, err := RemoveTaint(ctx, r.Client, r.APIReader, name, pure.Taint.Key); err != nil {
+		changed, err := RemoveTaint(ctx, r.Client, r.APIReader, name, pure.Taint.Key)
+		if err != nil {
 			taintErrs = append(taintErrs, err)
+			continue
 		}
+		if !changed {
+			continue // taint already absent: no event
+		}
+		logger.Info("removed remediation taint", "node", name, "key", pure.Taint.Key)
+		r.recordTaintAction(nodesByName[name], &policy, reasonTaintRemoved, pure, name)
 	}
 
+	oldHeld := policy.Status.HeldNodes // captured before writeStatus overwrites it
+	oldReason := ""
+	if c := apimeta.FindStatusCondition(original.Status.Conditions, wardenv1alpha1.ConditionRemediating); c != nil {
+		oldReason = c.Reason
+	}
 	writeStatus(&policy, decision)
+
+	// Policy-level warnings are edge-triggered on their own underlying state, not on any status
+	// change: during a sustained incident the counts shift every pass, and gating on the whole
+	// status would re-emit the same warning repeatedly (alert fatigue). The guard warning fires
+	// only when the guard newly trips; the missing-timestamp warning only for a newly held node.
+	if decision.Status.GuardTripped && oldReason != wardenv1alpha1.ReasonGuardTripped {
+		logger.Info("guard tripped, holding new remediations",
+			"matched", len(decision.Status.MatchedNodes),
+			"determinate", decision.Status.DeterminateCount,
+			"remediated", len(decision.Status.RemediatedNodes),
+			"maxAffectedPercent", pure.MaxAffectedPercent)
+		r.Recorder.Eventf(&policy, nil, corev1.EventTypeWarning, wardenv1alpha1.ReasonGuardTripped, "HoldRemediation",
+			"guard tripped: %d of %d nodes with a determinate condition match, exceeding maxAffectedPercent %d; holding new remediations, %d node(s) currently remediated",
+			len(decision.Status.MatchedNodes), decision.Status.DeterminateCount, pure.MaxAffectedPercent, len(decision.Status.RemediatedNodes))
+	}
+	for _, name := range decision.HeldMissingTimestamp {
+		if slices.Contains(oldHeld, name) {
+			continue // already reported as held on an earlier pass
+		}
+		logger.Info("holding: condition has no lastTransitionTime, debounce cannot be evaluated",
+			"node", name, "condition", pure.ConditionType)
+		r.Recorder.Eventf(&policy, nil, corev1.EventTypeWarning, reasonMissingTransitionTime, "HoldRemediation",
+			"condition %q on node %s has no lastTransitionTime; debounce cannot be evaluated, so the taint is left unchanged",
+			pure.ConditionType, name)
+	}
 
 	// A taint op failed on some node(s): status is still written above (best effort) and the
 	// aggregate error requeues so the failed nodes are retried.
@@ -126,6 +197,30 @@ func (r *NodeRemediationPolicyReconciler) Reconcile(ctx context.Context, req ctr
 		return ctrl.Result{}, err
 	}
 	return ctrl.Result{RequeueAfter: decision.RequeueAfter}, nil
+}
+
+// recordTaintAction emits a taint apply/remove event on both the affected node (so it shows in
+// `kubectl describe node`, keyed by the node's UID that kubectl filters on) and the policy (so it
+// shows in `kubectl describe nrp`), cross-linking the two via the event's `related` object. A nil
+// node (already gone) records only on the policy.
+func (r *NodeRemediationPolicyReconciler) recordTaintAction(node *corev1.Node, policy *wardenv1alpha1.NodeRemediationPolicy, reason string, pure remediation.Policy, nodeName string) {
+	// The machine-readable action and the human verb/preposition are all decided by whether this
+	// is an apply or a remove, so they are derived from the reason rather than passed in.
+	action, verb, prep := "ApplyTaint", "applied", "to"
+	if reason == reasonTaintRemoved {
+		action, verb, prep = "RemoveTaint", "removed", "from"
+	}
+	// related on the policy event stays untyped-nil when the node is gone (a typed (*Node)(nil)
+	// would be a non-nil interface and trip the recorder's reference building).
+	var relatedNode runtime.Object
+	if node != nil {
+		relatedNode = node
+		r.Recorder.Eventf(node, policy, corev1.EventTypeNormal, reason, action,
+			"%s %s taint %q (policy %s, condition %s=%s)",
+			verb, pure.Taint.Effect, pure.Taint.Key, policy.Name, pure.ConditionType, pure.ConditionStatus)
+	}
+	r.Recorder.Eventf(policy, relatedNode, corev1.EventTypeNormal, reason, action,
+		"%s %s taint %q %s node %s", verb, pure.Taint.Effect, pure.Taint.Key, prep, nodeName)
 }
 
 // projectPolicy converts the CRD spec into the pure remediation.Policy. Field defaults are
@@ -159,11 +254,15 @@ func taintFromSpec(t *corev1.Taint) remediation.Taint {
 }
 
 // observeNodes builds the read-only facts the pure core consumes, keeping only the one condition
-// the policy watches (absent -> zero ConditionFact, which the core holds on).
-func observeNodes(nodes []corev1.Node, p remediation.Policy) []remediation.NodeFact {
+// the policy watches (absent -> zero ConditionFact, which the core holds on). It also returns a
+// name->node index built in the same pass, so the shell can attach per-node events without
+// walking the node list again.
+func observeNodes(nodes []corev1.Node, p remediation.Policy) ([]remediation.NodeFact, map[string]*corev1.Node) {
 	facts := make([]remediation.NodeFact, 0, len(nodes))
+	byName := make(map[string]*corev1.Node, len(nodes))
 	for i := range nodes {
 		n := &nodes[i]
+		byName[n.Name] = n
 		var condition remediation.ConditionFact
 		for _, c := range n.Status.Conditions {
 			if string(c.Type) == p.ConditionType {
@@ -181,7 +280,7 @@ func observeNodes(nodes []corev1.Node, p remediation.Policy) []remediation.NodeF
 			HasTaint:  hasTaintKey(n, p.Taint.Key),
 		})
 	}
-	return facts
+	return facts, byName
 }
 
 // hasTaintKey reports whether the node carries a taint with the given key.

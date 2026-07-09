@@ -15,6 +15,13 @@ rules:
   - update
   - watch
 - apiGroups:
+  - events.k8s.io
+  resources:
+  - events
+  verbs:
+  - create
+  - patch
+- apiGroups:
   - warden.scality.com
   resources:
   - noderemediationpolicies

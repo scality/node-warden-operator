@@ -17,6 +17,8 @@ limitations under the License.
 package controller
 
 import (
+	"context"
+	"fmt"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -26,8 +28,11 @@ import (
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/events"
 	"k8s.io/client-go/util/workqueue"
 	"k8s.io/utils/ptr"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
@@ -75,14 +80,31 @@ func drainQueue(q workqueue.TypedRateLimitingInterface[reconcile.Request]) []str
 	return names
 }
 
+// drainEvents non-blockingly collects every event the fake recorder holds, so a spec can assert
+// on what was recorded. Each entry is formatted "<type> <reason> <note>".
+func drainEvents(rec *events.FakeRecorder) []string {
+	var got []string
+	for {
+		select {
+		case e := <-rec.Events:
+			got = append(got, e)
+		default:
+			return got
+		}
+	}
+}
+
 var _ = Describe("NodeRemediationPolicy Controller", func() {
 	var reconciler *NodeRemediationPolicyReconciler
+	var recorder *events.FakeRecorder
 
 	BeforeEach(func() {
+		recorder = events.NewFakeRecorder(64)
 		reconciler = &NodeRemediationPolicyReconciler{
 			Client:    k8sClient,
 			APIReader: k8sClient,
 			Scheme:    k8sClient.Scheme(),
+			Recorder:  recorder,
 		}
 	})
 
@@ -151,6 +173,29 @@ var _ = Describe("NodeRemediationPolicy Controller", func() {
 		}
 	}
 
+	// newFailingReconciler returns a reconciler whose Client fails every Node taint patch for
+	// failNode (simulating a node that cannot be written -- deleted mid-reconcile, retries
+	// exhausted) while every other write succeeds. APIReader stays the real uncached client, and
+	// status/finalizer writes (subresource patch / update) are not intercepted, so they still land.
+	newFailingReconciler := func(failNode string) *NodeRemediationPolicyReconciler {
+		base, err := client.NewWithWatch(cfg, client.Options{Scheme: k8sClient.Scheme()})
+		Expect(err).NotTo(HaveOccurred())
+		failing := interceptor.NewClient(base, interceptor.Funcs{
+			Patch: func(fctx context.Context, c client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+				if obj.GetName() == failNode {
+					return fmt.Errorf("simulated write failure on %s", failNode)
+				}
+				return c.Patch(fctx, obj, patch, opts...)
+			},
+		})
+		return &NodeRemediationPolicyReconciler{
+			Client:    failing,
+			APIReader: k8sClient,
+			Scheme:    k8sClient.Scheme(),
+			Recorder:  recorder,
+		}
+	}
+
 	It("applies the taint when the condition holds past the enter debounce", func() {
 		const nodeName, policyName, labelKey = "node-apply", "policy-apply", "test/apply"
 
@@ -188,6 +233,12 @@ var _ = Describe("NodeRemediationPolicy Controller", func() {
 		Expect(cond).NotTo(BeNil())
 		Expect(cond.Status).To(Equal(metav1.ConditionTrue))
 		Expect(cond.ObservedGeneration).To(Equal(policy.Generation))
+
+		By("recording a TaintApplied event naming the node")
+		Expect(drainEvents(recorder)).To(ContainElement(SatisfyAll(
+			ContainSubstring(reasonTaintApplied),
+			ContainSubstring(nodeName),
+		)))
 	})
 
 	It("enqueues only the policies whose watched condition actually changed", func() {
@@ -444,6 +495,41 @@ var _ = Describe("NodeRemediationPolicy Controller", func() {
 		Expect(cond).NotTo(BeNil())
 		Expect(cond.Status).To(Equal(metav1.ConditionFalse))
 		Expect(cond.Reason).To(Equal(wardenv1alpha1.ReasonGuardTripped))
+
+		By("recording a GuardTripped warning event on the policy")
+		Expect(drainEvents(recorder)).To(ContainElement(SatisfyAll(
+			ContainSubstring("Warning"),
+			ContainSubstring(wardenv1alpha1.ReasonGuardTripped),
+		)))
+	})
+
+	It("keeps remediating the other nodes and requeues when one node's taint write fails", func() {
+		const goodNode, badNode = "node-act-good", "node-act-bad"
+		const policyName, labelKey = "policy-act-partial", "test/actpartial"
+
+		createNode(goodNode, labelKey, testLabelValue, corev1.ConditionTrue, time.Now().Add(-2*time.Minute))
+		createNode(badNode, labelKey, testLabelValue, corev1.ConditionTrue, time.Now().Add(-2*time.Minute))
+		createPolicy(policyName, labelKey)
+
+		By("reconciling with the bad node's taint write failing")
+		r := newFailingReconciler(badNode)
+		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: policyName}})
+		Expect(err).To(HaveOccurred(), "a per-node failure must surface as an aggregate error so the reconcile requeues")
+
+		By("still tainting the healthy node despite the other node's failure")
+		var good corev1.Node
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: goodNode}, &good)).To(Succeed())
+		_, ok := findTaint(&good)
+		Expect(ok).To(BeTrue(), "the healthy node must be remediated even though another node failed")
+		var bad corev1.Node
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: badNode}, &bad)).To(Succeed())
+		_, ok = findTaint(&bad)
+		Expect(ok).To(BeFalse(), "the failing node must not be tainted")
+
+		By("writing the status best-effort despite the error")
+		var policy wardenv1alpha1.NodeRemediationPolicy
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: policyName}, &policy)).To(Succeed())
+		Expect(policy.Status.MatchedNodes).To(ContainElements(goodNode, badNode))
 	})
 
 	It("marks the policy InvalidSpec and stops requeuing on an invalid nodeSelector", func() {
@@ -472,6 +558,79 @@ var _ = Describe("NodeRemediationPolicy Controller", func() {
 		Expect(cond).NotTo(BeNil())
 		Expect(cond.Status).To(Equal(metav1.ConditionFalse))
 		Expect(cond.Reason).To(Equal(wardenv1alpha1.ReasonInvalidSpec))
+
+		By("recording an InvalidSpec warning event on the policy")
+		Expect(drainEvents(recorder)).To(ContainElement(SatisfyAll(
+			ContainSubstring("Warning"),
+			ContainSubstring(wardenv1alpha1.ReasonInvalidSpec),
+		)))
+	})
+
+	It("holds and warns when the matching condition has no lastTransitionTime", func() {
+		const nodeName, policyName, labelKey = "node-nots", "policy-nots", "test/nots"
+
+		node := &corev1.Node{
+			ObjectMeta: metav1.ObjectMeta{Name: nodeName, Labels: map[string]string{labelKey: testLabelValue}},
+		}
+		Expect(k8sClient.Create(ctx, node)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, node) })
+		node.Status.Conditions = []corev1.NodeCondition{{
+			Type:   corev1.NodeConditionType(testConditionType),
+			Status: corev1.ConditionTrue,
+			// LastTransitionTime intentionally left zero (some detectors omit it).
+		}}
+		Expect(k8sClient.Status().Update(ctx, node)).To(Succeed())
+		createPolicy(policyName, labelKey)
+
+		reconcileUntilStable(policyName)
+
+		By("not tainting the node, so the debounce is not bypassed")
+		var got corev1.Node
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: nodeName}, &got)).To(Succeed())
+		_, ok := findTaint(&got)
+		Expect(ok).To(BeFalse(), "node must not be tainted without a lastTransitionTime")
+
+		By("reporting the node as matched-but-Held, listed in heldNodes, not NoRemediation")
+		var policy wardenv1alpha1.NodeRemediationPolicy
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: policyName}, &policy)).To(Succeed())
+		Expect(policy.Status.MatchedNodes).To(ContainElement(nodeName))
+		Expect(policy.Status.PendingNodes).NotTo(ContainElement(nodeName))
+		Expect(policy.Status.HeldNodes).To(ContainElement(nodeName))
+		Expect(policy.Status.HeldCount).To(Equal(int32(1)))
+		cond := apimeta.FindStatusCondition(policy.Status.Conditions, wardenv1alpha1.ConditionRemediating)
+		Expect(cond).NotTo(BeNil())
+		Expect(cond.Reason).To(Equal(wardenv1alpha1.ReasonHeld))
+
+		By("recording a MissingTransitionTime warning on the policy")
+		Expect(drainEvents(recorder)).To(ContainElement(SatisfyAll(
+			ContainSubstring("Warning"),
+			ContainSubstring(reasonMissingTransitionTime),
+		)))
+	})
+
+	It("does not re-emit policy-level events on the settle reconcile", func() {
+		const nodeName, policyName, labelKey = "node-settle", "policy-settle", "test/settle"
+
+		node := &corev1.Node{
+			ObjectMeta: metav1.ObjectMeta{Name: nodeName, Labels: map[string]string{labelKey: testLabelValue}},
+		}
+		Expect(k8sClient.Create(ctx, node)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, node) })
+		node.Status.Conditions = []corev1.NodeCondition{{
+			Type:   corev1.NodeConditionType(testConditionType),
+			Status: corev1.ConditionTrue,
+			// no LastTransitionTime -> held -> MissingTransitionTime warning
+		}}
+		Expect(k8sClient.Status().Update(ctx, node)).To(Succeed())
+		createPolicy(policyName, labelKey)
+
+		By("emitting the warning on the pass that changes the status")
+		reconcilePolicy(policyName)
+		Expect(drainEvents(recorder)).To(ContainElement(ContainSubstring(reasonMissingTransitionTime)))
+
+		By("not re-emitting it on the settle pass where nothing changed")
+		reconcilePolicy(policyName)
+		Expect(drainEvents(recorder)).NotTo(ContainElement(ContainSubstring(reasonMissingTransitionTime)))
 	})
 
 	It("keeps the last-known node status when a working policy's spec becomes invalid", func() {
