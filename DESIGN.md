@@ -140,12 +140,13 @@ bumping the generation, and the loop must still wake to run the finalizer cleanu
 
 ## Notable decisions
 
-- **Validation via CEL.** The CRD's invariants -- `taint.effect` restricted to a real Kubernetes
-  taint effect, `taint.key` a valid qualified name (otherwise every node patch is rejected),
-  `debounce.enter`/`exit` a non-negative Go duration (otherwise decode stalls the reconcile), and
-  at least one remediation set -- are expressed as CEL validation rules on the schema, so no
-  admission webhook is needed today. One can still be added later if a check outgrows what CEL can
-  express.
+- **Validation via CEL, with a webhook only for the cross-object check.** The CRD's field-level
+  invariants -- `taint.effect` restricted to a real Kubernetes taint effect, `taint.key` a valid
+  qualified name (otherwise every node patch is rejected), `debounce.enter`/`exit` a non-negative Go
+  duration (otherwise decode stalls the reconcile), and at least one remediation set -- are
+  expressed as CEL validation rules on the schema, so no webhook is needed for them. The one
+  invariant CEL cannot express, because it spans objects (`taint.key` uniqueness across policies),
+  is enforced by a validating admission webhook instead (see below).
 - **Read-modify-write, not Server-Side Apply, for taints.** `node.spec.taints` is a plain
   list on the `Node` object, which node-warden does not own. To avoid clobbering taints set by
   anything else, the controller reads the node, adds or removes only the taint(s) whose key
@@ -155,9 +156,11 @@ bumping the generation, and the loop must still wake to run the finalizer cleanu
   tracks and cleans up its taint purely by `key` -- it does not tag ownership -- so two policies
   that share a `taint.key` interfere: each removes that key from every node it does not select, so
   one policy strips the taint another legitimately applied, and the node flaps. CEL cannot enforce
-  uniqueness across objects, so for v1 this is a documented operator constraint; a future
-  validating webhook can reject a duplicate key (and the exact key/duration limits CEL only
-  approximates) at admission.
+  uniqueness across objects, so a validating admission webhook does it instead: on create/update it
+  lists the policies and rejects one whose `taint.key` is already owned by another. A webhook cannot
+  fully close a TOCTOU race (two same-key policies admitted in the same instant), so the
+  controller's key-based cleanup remains the backstop. The webhook is served with a cert-manager
+  certificate, so deploying the operator now requires cert-manager in the cluster.
 - **The remediation taint is reversible; its effect is the policy's choice.** `effect` is
   validated to a real Kubernetes taint effect (`NoSchedule`, `PreferNoSchedule`, `NoExecute`), so
   an invalid value is rejected at admission instead of failing every `Node` update. `NoExecute`
