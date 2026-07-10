@@ -1,9 +1,8 @@
 # DESIGN.md
 
 Design overview for node-warden-operator. This is the root design
-doc: goals, architecture, and the decisions behind them. The full reconcile mechanics
-(predicate specifics, the debounce state machine, the guard-percentage math) are written up in
-detail once the behavior lands; this doc keeps that part high-level on purpose.
+doc: the goals, the architecture, the reconcile mechanics (the debounce state machine, the
+guard-percentage math, the watch predicates), and the decisions behind them.
 
 ## Goals
 
@@ -59,10 +58,6 @@ test/                  envtest + e2e (kind)
 
 ## Reconcile model: OBSERVE -> DECIDE -> ACT
 
-High level only here; a fuller write-up of the mechanics (predicate specifics, the
-debounce-via-`lastTransitionTime` state machine, the guard-percentage math) lands with the
-behavior itself.
-
 - **OBSERVE**: the controller watches `Node` and `NodeRemediationPolicy` objects. `Node` updates
   go through predicates that drop noise -- kubelet heartbeats and lease/heartbeat-only condition
   churn -- so the loop only wakes on changes that can affect a decision. Policy updates are not
@@ -74,13 +69,74 @@ behavior itself.
   evaluates each policy against the nodes it selects and returns a `Decision` -- which taints to
   add or remove, the status to write per policy, and when to requeue.
 - **ACT**: the shell applies the decision (taint add/remove on the matched nodes) and writes each
-  policy's status exactly once, then requeues if it asks for it (e.g. to re-check a
-  pending debounce window later). It also emits structured logs and Kubernetes `Events` for
-  what happened (see below), so an operator can follow the decisions without reading logs.
+  policy's status exactly once, then requeues if it asks for it (e.g. to re-check a pending
+  debounce window later). A per-node taint write that fails does not abort the others: the errors
+  are aggregated and returned so the failed nodes are retried on the requeue, while the healthy
+  nodes are still remediated. It also emits structured logs and Kubernetes `Events` for what
+  happened (see below), so an operator can follow the decisions without reading logs.
 
 Because the decision is pure, edge cases -- flapping, a partial outage over the guard,
 `Unknown` conditions, recovery, relabeling, self-trigger loops -- are covered by table-driven
 unit tests against `Decide`, not by cluster-dependent tests against the controller.
+
+### The debounce state machine
+
+Debounce is measured from the watched condition's `lastTransitionTime`, not from a timer the
+operator keeps: `stableFor = now - lastTransitionTime`. For a selected node whose condition matches:
+
+- if it is not yet tainted and `stableFor >= debounce.enter`, the taint is applied; otherwise the
+  node is *pending* and the reconcile is requeued after `enter - stableFor`;
+- once tainted, it stays tainted while the condition holds (steady state, a no-op pass).
+
+For a selected node whose condition has determinately cleared (present, not the trigger status, not
+`Unknown`) and still carries the taint: if `stableFor >= debounce.exit` the taint is removed,
+otherwise the reconcile is requeued after `exit - stableFor`.
+
+Two situations are *held* rather than acted on:
+
+- **`Unknown` or unreported.** The detector is down or the node is unreachable; recovery is never
+  assumed, so the node keeps whatever taint it has and is surfaced in `status.unknownNodes`.
+- **No `lastTransitionTime`.** Some detectors omit it, so stability cannot be measured. Rather than
+  bypass the debounce on a saturated `now - zero`, the node is held and surfaced in
+  `status.heldNodes` alongside a `MissingTransitionTime` event.
+
+The requeue the pass returns is the smallest positive per-node wait, so a single reconcile re-checks
+every pending window at the right time.
+
+### The guard percentage
+
+The guard bounds the blast radius, so a cluster-wide event (a detector bug or a network partition
+tripping the condition on many nodes at once) does not remediate the whole fleet. It is evaluated
+over the *determinate* nodes only -- the selected nodes whose condition is matched or determinately
+cleared; `Unknown`/unreported nodes carry no signal and are excluded, so a partial detector outage
+cannot dilute the denominator exactly when it matters.
+
+The comparison is exact-rational integer math (no float): with `matched` matching nodes out of
+`determinate` determinate ones, the guard trips when
+
+```
+matched * 100 > maxAffectedPercent * determinate
+```
+
+The `>` is strict, so a fraction exactly at the limit does not trip. A tripped guard blocks only
+*new* taint applications (matching-but-untainted nodes stay pending); it never blocks removal or
+recovery, and never disturbs nodes already remediated. `maxAffectedPercent: 100` disables it.
+
+### The watch predicates
+
+`Node` objects change constantly (kubelet heartbeats every few seconds), so an unfiltered watch
+would wake the loop for nothing. Two predicates gate `Node` events:
+
+- **`conditionStatusChanged`** passes an update only when the *watched* condition's status changed,
+  or that condition appeared or disappeared. Heartbeat-only churn (a bumped `lastHeartbeatTime`),
+  lease renewals, and changes to conditions the policy does not watch are all dropped.
+- **`taintsChanged`** passes an update when the node's taint set changed, so the loop re-observes
+  after its own (or an external) taint write and converges `status.remediatedNodes`.
+
+A `Node` event is mapped to precisely the policies the change can affect -- the diff is computed in
+the enqueue handler, not by re-listing every policy. The `NodeRemediationPolicy` watch, by
+contrast, carries no generation-changed predicate: a deletion sets `deletionTimestamp` without
+bumping the generation, and the loop must still wake to run the finalizer cleanup.
 
 ## Notable decisions
 

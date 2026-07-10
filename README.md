@@ -35,8 +35,9 @@ make install   # install the CRD
 make deploy    # deploy the controller (image: ghcr.io/scality/node-warden-operator:latest)
 ```
 
-Then create a `NodeRemediationPolicy`. The CRD and sample manifests land in a later pull
-request; once available, the samples can be applied with:
+Then create a `NodeRemediationPolicy`. A commented example lives in
+[`config/samples/`](config/samples/warden_v1alpha1_noderemediationpolicy.yaml); apply it (and edit
+the condition, taint and thresholds for your environment) with:
 
 ```sh
 kubectl apply -k config/samples/
