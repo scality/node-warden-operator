@@ -1,9 +1,34 @@
+# Example NodeRemediationPolicy: taint a node while a node condition is set, and remove the taint
+# once the condition clears. node-warden does not detect the condition itself -- it only reacts to
+# a condition that another component (node-problem-detector, the kubelet, a custom probe, ...) has
+# already set on the Node. Adjust the condition, taint and thresholds to your environment.
 apiVersion: warden.scality.com/v1alpha1
 kind: NodeRemediationPolicy
 metadata:
-  labels:
-    app.kubernetes.io/name: node-warden-operator
-    app.kubernetes.io/managed-by: kustomize
   name: noderemediationpolicy-sample
 spec:
-  # TODO(user): Add fields here
+  # The node condition to react to.
+  condition:
+    type: KernelDeadlock # any Node condition type your detector sets
+    status: "True"        # the status that triggers remediation: True | False | Unknown
+  # nodeSelector scopes the policy to a subset of nodes; omit it to cover every node.
+  nodeSelector:
+    matchLabels:
+      node-role.kubernetes.io/worker: ""
+  # The remediation to apply. v1 supports a single, reversible taint.
+  remediations:
+    taint:
+      key: warden.scality.com/kernel-deadlock
+      # NoExecute evicts pods that do not tolerate the taint and drops the node from Service
+      # endpoints; NoSchedule / PreferNoSchedule only keep new pods off the node.
+      effect: NoExecute
+  # How long the condition must hold (enter) or be clear (exit) before the taint is applied or
+  # removed, to ride out flapping.
+  debounce:
+    enter: 60s
+    exit: 30s
+  # Blast-radius guard: if more than maxAffectedPercent of the selected nodes that report a
+  # determinate condition match, node-warden remediates none of them -- a cluster-wide event is not
+  # a per-node fault. 100 disables the guard.
+  guard:
+    maxAffectedPercent: 50
