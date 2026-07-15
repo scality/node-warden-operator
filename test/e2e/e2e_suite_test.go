@@ -36,6 +36,8 @@ var (
 	managerImage = "example.com/node-warden-operator:v0.0.1"
 	// shouldCleanupCertManager tracks whether CertManager was installed by this suite.
 	shouldCleanupCertManager = false
+	// shouldCleanupPrometheus tracks whether the Prometheus Operator was installed by this suite.
+	shouldCleanupPrometheus = false
 )
 
 // TestE2E runs the e2e test suite to validate the solution in an isolated environment.
@@ -64,9 +66,11 @@ var _ = BeforeSuite(func() {
 
 	configureKubectlKubeRC()
 	setupCertManager()
+	setupPrometheusOperator()
 })
 
 var _ = AfterSuite(func() {
+	teardownPrometheusOperator()
 	teardownCertManager()
 })
 
@@ -116,4 +120,36 @@ func teardownCertManager() {
 
 	By("uninstalling CertManager")
 	utils.UninstallCertManager()
+}
+
+// setupPrometheusOperator installs the Prometheus Operator, which provides the ServiceMonitor CRD
+// the default deployment ships. Skips installation if PROMETHEUS_INSTALL_SKIP=true or if present.
+func setupPrometheusOperator() {
+	if os.Getenv("PROMETHEUS_INSTALL_SKIP") == "true" {
+		_, _ = fmt.Fprintf(GinkgoWriter, "Skipping Prometheus Operator installation (PROMETHEUS_INSTALL_SKIP=true)\n")
+		return
+	}
+
+	By("checking if the Prometheus Operator is already installed")
+	if utils.IsPrometheusCRDsInstalled() {
+		_, _ = fmt.Fprintf(GinkgoWriter, "Prometheus Operator is already installed. Skipping installation.\n")
+		return
+	}
+
+	// Mark for cleanup before installation to handle interruptions and partial installs.
+	shouldCleanupPrometheus = true
+
+	By("installing the Prometheus Operator")
+	Expect(utils.InstallPrometheusOperator()).To(Succeed(), "Failed to install the Prometheus Operator")
+}
+
+// teardownPrometheusOperator uninstalls the Prometheus Operator if it was installed by this suite.
+func teardownPrometheusOperator() {
+	if !shouldCleanupPrometheus {
+		_, _ = fmt.Fprintf(GinkgoWriter, "Skipping Prometheus Operator cleanup (not installed by this suite)\n")
+		return
+	}
+
+	By("uninstalling the Prometheus Operator")
+	utils.UninstallPrometheusOperator()
 }

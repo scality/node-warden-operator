@@ -28,8 +28,14 @@ import (
 )
 
 const (
+	// renovate: datasource=github-releases depName=cert-manager/cert-manager
 	certmanagerVersion = "v1.20.2"
 	certmanagerURLTmpl = "https://github.com/cert-manager/cert-manager/releases/download/%s/cert-manager.yaml"
+
+	// renovate: datasource=github-releases depName=prometheus-operator/prometheus-operator
+	prometheusOperatorVersion = "v0.92.1"
+	prometheusOperatorURLTmpl = "https://github.com/prometheus-operator/prometheus-operator/" +
+		"releases/download/%s/bundle.yaml"
 
 	defaultKindBinary  = "kind"
 	defaultKindCluster = "kind"
@@ -123,6 +129,60 @@ func IsCertManagerCRDsInstalled() bool {
 	// Check if any of the Cert Manager CRDs are present
 	crdList := GetNonEmptyLines(output)
 	for _, crd := range certManagerCRDs {
+		for _, line := range crdList {
+			if strings.Contains(line, crd) {
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
+// InstallPrometheusOperator installs the Prometheus Operator, which provides the ServiceMonitor
+// CRD that the default deployment now ships. It uses `kubectl create` because the bundle's CRDs are
+// too large for the client-side-apply annotation.
+func InstallPrometheusOperator() error {
+	url := fmt.Sprintf(prometheusOperatorURLTmpl, prometheusOperatorVersion)
+	cmd := exec.Command("kubectl", "create", "-f", url)
+	if _, err := Run(cmd); err != nil {
+		return err
+	}
+	// Wait for the ServiceMonitor CRD to be established so the manager deploy that creates one does
+	// not race the CRD registration.
+	cmd = exec.Command("kubectl", "wait", "--for", "condition=Established",
+		"crd/servicemonitors.monitoring.coreos.com", "--timeout", "2m")
+	_, err := Run(cmd)
+	return err
+}
+
+// UninstallPrometheusOperator uninstalls the Prometheus Operator.
+func UninstallPrometheusOperator() {
+	url := fmt.Sprintf(prometheusOperatorURLTmpl, prometheusOperatorVersion)
+	cmd := exec.Command("kubectl", "delete", "-f", url)
+	if _, err := Run(cmd); err != nil {
+		warnError(err)
+	}
+}
+
+// IsPrometheusCRDsInstalled checks whether the Prometheus Operator CRDs (notably ServiceMonitor)
+// are already present, so the suite does not reinstall an operator the cluster already has.
+func IsPrometheusCRDsInstalled() bool {
+	cmd := exec.Command("kubectl", "get", "crds")
+	output, err := Run(cmd)
+	if err != nil {
+		return false
+	}
+
+	prometheusCRDs := []string{
+		"servicemonitors.monitoring.coreos.com",
+		"prometheuses.monitoring.coreos.com",
+		"prometheusrules.monitoring.coreos.com",
+		"podmonitors.monitoring.coreos.com",
+	}
+
+	crdList := GetNonEmptyLines(output)
+	for _, crd := range prometheusCRDs {
 		for _, line := range crdList {
 			if strings.Contains(line, crd) {
 				return true
