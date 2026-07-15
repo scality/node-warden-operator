@@ -29,9 +29,11 @@ on both the affected node (`kubectl describe node`) and the policy (`kubectl des
 ## Deploy
 
 The operator image is built and published to `ghcr.io/scality/node-warden-operator` by CI. The
-validating webhook is served with a cert-manager-issued certificate, so
-[cert-manager](https://cert-manager.io/) must already be installed in the cluster. Deploy the
-operator into the cluster your `kubectl` currently targets:
+default deployment expects two components already installed in the cluster:
+[cert-manager](https://cert-manager.io/), which issues the certificate the validating webhook is
+served with, and the [Prometheus Operator](https://prometheus-operator.dev/), whose `ServiceMonitor`
+CRD the deployment ships to scrape the operator's metrics. Deploy the operator into the cluster your
+`kubectl` currently targets:
 
 ```sh
 make install   # install the CRD
