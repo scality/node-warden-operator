@@ -10,7 +10,7 @@ jobs:
   review:
     # May also trigger on bump branches when a human updates them (acceptable double-review).
     if: github.event_name == 'pull_request' && github.actor != 'dependabot[bot]' && github.actor != 'scality-renovate[bot]'
-    uses: scality/workflows/.github/workflows/claude-code-review.yml@174a4246774e3d858cbac6ebacd2f07ecbaeedbf # v2.8.5
+    uses: scality/workflows/.github/workflows/claude-code-review.yml@7d91dc4ebbe136b54518aa42a1ad6014f8f91526 # v2.9.1
     secrets:
       GCP_WORKLOAD_IDENTITY_PROVIDER: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
       GCP_SERVICE_ACCOUNT: ${{ secrets.GCP_SERVICE_ACCOUNT }}
@@ -20,7 +20,7 @@ jobs:
   review-dependency-bump:
     # pr.user.login catches bump PRs updated by a human, where github.actor is no longer the bot.
     if: github.event_name == 'pull_request_target' && (github.actor == 'dependabot[bot]' || github.event.pull_request.user.login == 'dependabot[bot]' || github.actor == 'scality-renovate[bot]' || github.event.pull_request.user.login == 'scality-renovate[bot]')
-    uses: scality/workflows/.github/workflows/claude-code-dependency-review.yml@174a4246774e3d858cbac6ebacd2f07ecbaeedbf # v2.8.5
+    uses: scality/workflows/.github/workflows/claude-code-dependency-review.yml@7d91dc4ebbe136b54518aa42a1ad6014f8f91526 # v2.9.1
     with:
       ACTIONS_APP_ID: ${{ vars.ACTIONS_APP_ID }}
     secrets:
