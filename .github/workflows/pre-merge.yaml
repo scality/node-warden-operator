@@ -15,6 +15,7 @@ jobs:
       is-development: true
       is-latest: false
       is-stable: false
+      push-image: false
 
   generate:
     runs-on: ubuntu-24.04
