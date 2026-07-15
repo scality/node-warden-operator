@@ -18,6 +18,11 @@ on:
         required: false
         default: false
         type: boolean
+      push-image:
+        description: "Whether the image should be pushed to the registry or not"
+        required: false
+        default: true
+        type: boolean
 
 jobs:
   build:
@@ -32,6 +37,7 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
       - name: Login to the registry
+        if: ${{ inputs.push-image }}
         uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
         with:
           registry: ghcr.io
@@ -56,7 +62,7 @@ jobs:
           context: .
           build-args:
             VERSION=${{ steps.tags.outputs.version }}
-          push: true
+          push: ${{ inputs.push-image }}
           tags: ${{ steps.tags.outputs.tags }}
           cache-from: type=gha,scope=node-warden-operator
           cache-to: type=gha,mode=max,scope=node-warden-operator
