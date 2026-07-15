@@ -23,6 +23,9 @@ on:
           - "minor"
           - "major"
 
+permissions:
+  contents: read
+
 jobs:
   prepare-version:
     runs-on: ubuntu-24.04
@@ -42,7 +45,8 @@ jobs:
           token: ${{ steps.app-token.outputs.token }}
       - name: Install semver tool
         run: |
-          curl --fail -LO https://raw.githubusercontent.com/fsaintjacques/semver-tool/3.4.0/src/semver
+          curl --fail -Lo ./semver \
+            https://raw.githubusercontent.com/fsaintjacques/semver-tool/837ad91179c4126e3b7ff73c35091d5ef561d9a3/src/semver
           chmod +x ./semver
       - name: Compose release tag
         run: |
@@ -76,8 +80,8 @@ jobs:
           git fsck
           git gc
 
-          git config --global user.email ${{ github.actor }}@scality.com
-          git config --global user.name ${{ github.actor }}
+          git config --global user.email '${{ github.actor }}@scality.com'
+          git config --global user.name '${{ github.actor }}'
 
           git tag -a "${{ env.RELEASE_TAG }}" -m "Node Warden Operator ${{ env.RELEASE_TAG }}"
           git push origin "${{ env.RELEASE_TAG }}"
