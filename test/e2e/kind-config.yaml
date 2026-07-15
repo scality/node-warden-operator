@@ -1,0 +1,11 @@
+# Kind cluster for the e2e suite: a control-plane node plus three workers. The remediation specs
+# drive conditions onto the workers and assert node-warden taints them, so the control-plane (which
+# runs the cluster's own components) is never the target of a NoExecute taint. Three workers let the
+# guard spec exceed maxAffectedPercent (2 of 3 matching) and then fall back within it.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+  - role: control-plane
+  - role: worker
+  - role: worker
+  - role: worker
