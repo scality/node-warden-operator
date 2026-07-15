@@ -15,8 +15,9 @@ to one or more remediations. For v1, the only remediation is a reversible taint 
 policy chooses: `NoExecute` evicts non-tolerating pods and drops the node from Service endpoints,
 so traffic stops being routed to it, while `NoSchedule`/`PreferNoSchedule` only keep new pods off
 the node. The taint's identity (key, value, effect) is immutable once the policy exists; delete and
-recreate the policy to change it. Each policy owns its taint by `key`, so give different policies
-different `taint.key`s -- two policies sharing a key fight over the same taint. The taint is removed
+recreate the policy to change it. Each policy owns its taint by `key`, so different policies need
+different `taint.key`s -- a validating webhook rejects a policy whose key another policy already
+uses (two policies sharing a key would fight over the same taint). The taint is removed
 automatically once the condition clears, and when the policy is deleted -- a finalizer removes it
 from the affected nodes first.
 
@@ -27,8 +28,10 @@ on both the affected node (`kubectl describe node`) and the policy (`kubectl des
 
 ## Deploy
 
-The operator image is built and published to `ghcr.io/scality/node-warden-operator` by CI.
-Deploy the latest release into the cluster your `kubectl` currently targets:
+The operator image is built and published to `ghcr.io/scality/node-warden-operator` by CI. The
+validating webhook is served with a cert-manager-issued certificate, so
+[cert-manager](https://cert-manager.io/) must already be installed in the cluster. Deploy the
+operator into the cluster your `kubectl` currently targets:
 
 ```sh
 make install   # install the CRD
