@@ -16,6 +16,11 @@ jobs:
       GCP_SERVICE_ACCOUNT: ${{ secrets.GCP_SERVICE_ACCOUNT }}
       ANTHROPIC_VERTEX_PROJECT_ID: ${{ secrets.ANTHROPIC_VERTEX_PROJECT_ID }}
       CLOUD_ML_REGION: ${{ secrets.CLOUD_ML_REGION }}
+      # The review prompt is a slash command shipped by the scality-skills
+      # plugin, which the shared workflow clones from the agent-hub marketplace
+      # with this app key. Without it the plugin is skipped and the review
+      # silently does nothing.
+      ACTIONS_APP_PRIVATE_KEY: ${{ secrets.ACTIONS_APP_PRIVATE_KEY }}
 
   review-dependency-bump:
     # pr.user.login catches bump PRs updated by a human, where github.actor is no longer the bot.
