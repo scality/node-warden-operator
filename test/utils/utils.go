@@ -33,7 +33,7 @@ const (
 	certmanagerURLTmpl = "https://github.com/cert-manager/cert-manager/releases/download/%s/cert-manager.yaml"
 
 	// renovate: datasource=github-releases depName=prometheus-operator/prometheus-operator
-	prometheusOperatorVersion = "v0.93.0"
+	prometheusOperatorVersion = "v0.93.1"
 	prometheusOperatorURLTmpl = "https://github.com/prometheus-operator/prometheus-operator/" +
 		"releases/download/%s/bundle.yaml"
 
