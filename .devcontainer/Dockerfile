@@ -27,7 +27,7 @@ RUN curl -sSfLo /tmp/kubebuilder "https://github.com/kubernetes-sigs/kubebuilder
   && kubebuilder completion zsh | sudo tee /usr/local/share/zsh/site-functions/_kubebuilder >/dev/null
 
 # renovate: datasource=github-releases depName=kubernetes/kubernetes
-ARG KUBECTL_VERSION=v1.36.3
+ARG KUBECTL_VERSION=v1.37.0
 RUN curl -sSfLo /tmp/kubectl "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl" \
   && sudo install -m 0755 /tmp/kubectl /usr/local/bin/kubectl \
   && rm /tmp/kubectl \
