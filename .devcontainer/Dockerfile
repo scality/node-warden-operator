@@ -6,7 +6,7 @@ USER vscode
 RUN sudo mkdir -p /usr/local/share/zsh/site-functions
 
 # renovate: datasource=github-releases depName=golangci/golangci-lint
-ARG GOLANGCI_VERSION=v2.12.2
+ARG GOLANGCI_VERSION=v2.13.2
 # Fetch the install script pinned to the release tag (not HEAD) before piping to sh.
 RUN curl -sSfL "https://raw.githubusercontent.com/golangci/golangci-lint/${GOLANGCI_VERSION}/install.sh" \
   | sudo sh -s -- -b /usr/local/bin ${GOLANGCI_VERSION} \
