@@ -13,7 +13,7 @@ RUN curl -sSfL "https://raw.githubusercontent.com/golangci/golangci-lint/${GOLAN
   && golangci-lint completion zsh | sudo tee /usr/local/share/zsh/site-functions/_golangci-lint >/dev/null
 
 # renovate: datasource=github-releases depName=kubernetes-sigs/kind
-ARG KIND_VERSION=v0.32.0
+ARG KIND_VERSION=v0.33.0
 RUN curl -sSfLo /tmp/kind "https://kind.sigs.k8s.io/dl/${KIND_VERSION}/kind-linux-amd64" \
   && sudo install -m 0755 /tmp/kind /usr/local/bin/kind \
   && rm /tmp/kind \
