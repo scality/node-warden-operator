@@ -1,6 +1,6 @@
 module github.com/scality/node-warden-operator
 
-go 1.26.5
+go 1.27.1
 
 require (
 	github.com/onsi/ginkgo/v2 v2.29.0
