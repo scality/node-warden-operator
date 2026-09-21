@@ -20,7 +20,7 @@ RUN curl -sSfLo /tmp/kind "https://kind.sigs.k8s.io/dl/${KIND_VERSION}/kind-linu
   && kind completion zsh | sudo tee /usr/local/share/zsh/site-functions/_kind >/dev/null
 
 # renovate: datasource=github-releases depName=kubernetes-sigs/kubebuilder
-ARG KUBEBUILDER_VERSION=v4.15.0
+ARG KUBEBUILDER_VERSION=v4.16.0
 RUN curl -sSfLo /tmp/kubebuilder "https://github.com/kubernetes-sigs/kubebuilder/releases/download/${KUBEBUILDER_VERSION}/kubebuilder_linux_amd64" \
   && sudo install -m 0755 /tmp/kubebuilder /usr/local/bin/kubebuilder \
   && rm /tmp/kubebuilder \
