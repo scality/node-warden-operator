@@ -34,7 +34,7 @@ RUN curl -sSfLo /tmp/kubectl "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/l
   && kubectl completion zsh | sudo tee /usr/local/share/zsh/site-functions/_kubectl >/dev/null
 
 # renovate: datasource=github-releases depName=kubernetes-sigs/kustomize extractVersion=^kustomize/(?<version>v.+)$
-ARG KUSTOMIZE_VERSION=v5.8.1
+ARG KUSTOMIZE_VERSION=v5.8.3
 RUN curl -sSfLo /tmp/kustomize.tar.gz "https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2F${KUSTOMIZE_VERSION}/kustomize_${KUSTOMIZE_VERSION}_linux_amd64.tar.gz" \
   && tar -C /tmp -xzf /tmp/kustomize.tar.gz kustomize \
   && sudo install -m 0755 /tmp/kustomize /usr/local/bin/kustomize \
