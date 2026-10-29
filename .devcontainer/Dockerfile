@@ -1,4 +1,4 @@
-FROM mcr.microsoft.com/devcontainers/go:1.26-trixie@sha256:638cb8e8c040d29fbd0bb9a0d174b10aef96683437f839048d091eb337a8ea85
+FROM mcr.microsoft.com/devcontainers/go:1.27-trixie@sha256:32aad7e9eefed4fe99987cc4efef2f9723bd57c556f171143ecf65e0ba855ff3
 
 USER vscode
 
@@ -6,7 +6,7 @@ USER vscode
 RUN sudo mkdir -p /usr/local/share/zsh/site-functions
 
 # renovate: datasource=github-releases depName=golangci/golangci-lint
-ARG GOLANGCI_VERSION=v2.14.0
+ARG GOLANGCI_VERSION=v2.15.0
 # Fetch the install script pinned to the release tag (not HEAD) before piping to sh.
 RUN curl -sSfL "https://raw.githubusercontent.com/golangci/golangci-lint/${GOLANGCI_VERSION}/install.sh" \
   | sudo sh -s -- -b /usr/local/bin ${GOLANGCI_VERSION} \
@@ -34,7 +34,7 @@ RUN curl -sSfLo /tmp/kubectl "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/l
   && kubectl completion zsh | sudo tee /usr/local/share/zsh/site-functions/_kubectl >/dev/null
 
 # renovate: datasource=github-releases depName=kubernetes-sigs/kustomize extractVersion=^kustomize/(?<version>v.+)$
-ARG KUSTOMIZE_VERSION=v5.8.1
+ARG KUSTOMIZE_VERSION=v5.8.3
 RUN curl -sSfLo /tmp/kustomize.tar.gz "https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2F${KUSTOMIZE_VERSION}/kustomize_${KUSTOMIZE_VERSION}_linux_amd64.tar.gz" \
   && tar -C /tmp -xzf /tmp/kustomize.tar.gz kustomize \
   && sudo install -m 0755 /tmp/kustomize /usr/local/bin/kustomize \
