@@ -196,9 +196,9 @@ GOLANGCI_LINT = $(LOCALBIN)/golangci-lint
 
 ## Tool Versions
 # renovate: datasource=github-releases depName=kubernetes-sigs/kustomize extractVersion=^kustomize/(?<version>.*)$
-KUSTOMIZE_VERSION ?= v5.8.1
+KUSTOMIZE_VERSION ?= v5.8.3
 # renovate: datasource=github-releases depName=kubernetes-sigs/controller-tools
-CONTROLLER_TOOLS_VERSION ?= v0.21.0
+CONTROLLER_TOOLS_VERSION ?= v0.23.0
 
 #ENVTEST_VERSION is the controller-runtime version to use for setup-envtest, derived from go.mod
 ENVTEST_VERSION ?= $(shell v='$(call gomodver,sigs.k8s.io/controller-runtime)'; \
@@ -211,7 +211,7 @@ ENVTEST_K8S_VERSION ?= $(shell v='$(call gomodver,k8s.io/api)'; \
   printf '%s\n' "$$v" | sed -E 's/^v?[0-9]+\.([0-9]+).*/1.\1/')
 
 # renovate: datasource=github-releases depName=golangci/golangci-lint
-GOLANGCI_LINT_VERSION ?= v2.14.0
+GOLANGCI_LINT_VERSION ?= v2.15.0
 
 .PHONY: kustomize
 kustomize: $(KUSTOMIZE) ## Download kustomize locally if necessary.
