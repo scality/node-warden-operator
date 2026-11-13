@@ -80,3 +80,20 @@ jobs:
           sudo mv ./kind /usr/local/bin/kind
       - name: Run e2e tests
         run: make test-e2e
+
+  pre-merge:
+    name: Pre Merge
+    # Single check for rulesets to require: GitHub reports one check per job, never one per workflow
+    # always(): a job skipped because a dependency failed reports success and would let the PR merge
+    if: always()
+    needs:
+      - build
+      - generate
+      - lint
+      - test
+      - test-e2e
+    runs-on: ubuntu-26.04
+    steps:
+      - name: Fail if a pre-merge job failed or was cancelled
+        if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
+        run: exit 1
