@@ -8,7 +8,7 @@ how it is built and why see [DESIGN.md](DESIGN.md).
 
 The repository ships a devcontainer (`.devcontainer/`) with Go and the pinned tooling
 (golangci-lint, kind, kubebuilder, kubectl, kustomize) already installed. Outside the
-devcontainer you need Go 1.27+ and those tools on your `PATH` for the full workflow.
+devcontainer you need Go (the version in `go.mod`) and those tools on your `PATH` for the full workflow.
 
 Everyday commands:
 
