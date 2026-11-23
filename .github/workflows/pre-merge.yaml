@@ -16,21 +16,18 @@ jobs:
       is-latest: false
       is-stable: false
 
-  generate:
-    runs-on: ubuntu-26.04
-    steps:
-      - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Setup go
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
-        with:
-          go-version-file: go.mod
-      - name: Run code generation
-        # We run code generation to ensure that the generated code is up to date
-        run: |
-          go generate ./... &&
-          make generate manifests &&
-          git diff --quiet
+  go-generated:
+    # On a Renovate branch, pushes the regenerated code itself.
+    uses: scality/workflows/.github/workflows/go-generated.yaml@1c3bb83b992d0a512c08755606ee6439b26c463b # v2.13.0
+    secrets:
+      ACTIONS_APP_PRIVATE_KEY: ${{ secrets.ACTIONS_APP_PRIVATE_KEY }}
+    with:
+      commands: |
+        go mod tidy
+        go generate ./...
+        make manifests generate
+      push-to-renovate-branches: true
+      actions-app-id: ${{ vars.ACTIONS_APP_ID }}
 
   lint:
     runs-on: ubuntu-26.04
@@ -88,7 +85,7 @@ jobs:
     if: always()
     needs:
       - build
-      - generate
+      - go-generated
       - lint
       - test
       - test-e2e
